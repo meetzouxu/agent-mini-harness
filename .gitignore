@@ -1,0 +1,25 @@
+# ===== 密钥与环境（严禁入库）=====
+# DeepSeek API key 存放在 .env 中，本文件已 gitignore
+.env
+
+# ===== Python =====
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 运行产物 =====
+# 迭代 8（保存状态）会引入会话持久化目录（JSONL transcript）
+sessions/
+logs/
+.tasks/
+.memory/
+.scheduled_tasks.json
+
+# ===== 编辑器/系统 =====
+.idea/
+.vscode/
+.DS_Store
