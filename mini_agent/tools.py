@@ -4,19 +4,22 @@
 
 Tool 2.0 —— 对应 claude-code 的核心字段：
     name / description / parameters(JSON Schema) / handler  → 迭代 1 已有
-    is_concurrency_safe  → 本轮新增：相同输入可否并行（FileRead/Glob/ls 为真，
+    is_concurrency_safe  → 迭代 2 新增：相同输入可否并行（FileRead/Glob/ls 为真，
                             rm/Bash/Edit 为假），是「全并发或全串行」分派依据
-    is_read_only         → 本轮新增：只读标记（迭代 3 权限管线会用到，先埋点）
-    max_result_chars     → 本轮新增：工具级结果预算（对应 CC 的 maxResultSizeChars，
+    is_read_only         → 迭代 2 新增：只读标记（迭代 3 权限模式读取它）
+    max_result_chars     → 迭代 2 新增：工具级结果预算（对应 CC 的 maxResultSizeChars，
                             Bash 30_000 / Read Infinity，每工具各不相同）
+    check_permissions    → 迭代 3 新增：工具自带硬边界钩子（bash 黑名单/路径围栏）
 
-调用链路（对应 CC 的 10 步，本迭代实现加粗部分）：
+调用链路（对应 CC 的 10 步，已实现部分加粗）：
     API 返回 tool_use → 查表 findToolByName → **validateInput（参数校验）**
-    → [迭代 3：canUseTool/checkPermissions] → **call（执行）** → **ToolResult（截断回填）**
+    → **checkPermissions（权限管线，迭代 3：黑名单/围栏 → 规则 → 默认）**
+    → **call（执行）** → **ToolResult（截断回填）**
 
-安全底线（迭代 3 才有完整权限管线，这里保留两道粗闸）：
-- 工作目录围栏 safe_path()（迭代 1 已有）
-- Bash 危险命令黑名单（本轮新增的临时闸，迭代 3 用三道闸门权限管线替换）
+安全设计（迭代 3 重构）：
+- 硬边界（bash 黑名单 / 路径围栏）前移到 check_permissions 钩子，
+  作为权限管线的闸门 0（对应 CC 工具自带 checkPermissions）；
+- handler 里的 safe_path 保留为纵深防御（权限层漏拦时仍拦截）。
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+from .permissions import Behavior, PermissionResult
 
 # ---- 常量 ----
 DEFAULT_MAX_RESULT_CHARS = 8000   # 工具结果预算默认值（迭代 6 压缩会细化它）
@@ -68,8 +73,12 @@ class Tool:
 
     # ---- 迭代 2 新增标记 ----
     is_concurrency_safe: bool = False  # 只读无副作用 → 同轮可并行执行
-    is_read_only: bool = False         # 只读操作（迭代 3 权限模式会读取它）
+    is_read_only: bool = False         # 只读操作（迭代 3 权限模式读取它）
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS  # 工具级结果预算
+
+    # ---- 迭代 3 新增：权限钩子（闸门 0，对应 CC 工具自带 checkPermissions） ----
+    # 返回 None = 本层不裁决，交给通用闸门（对应 CC 的 passthrough 语义）
+    check_permissions: Callable[[dict], "PermissionResult | None"] | None = None
 
     def to_api_schema(self) -> dict:
         """转成 OpenAI/DeepSeek tools 参数要求的格式。"""
@@ -102,7 +111,8 @@ class Tool:
                 raise ToolError(f"参数 {key} 类型错误：期望 {declared}，收到 {type(value).__name__}")
 
     def run(self, arguments: dict) -> str:
-        """校验 → 执行 → 截断。"""
+        """校验 → 执行 → 截断。（权限检查在 agent 循环里、本方法之前；
+        校验双重执行是纵深防御，幂等无害。）"""
         self.validate_arguments(arguments)
         output = self.handler(arguments)
         if len(output) > self.max_result_chars:
@@ -113,18 +123,55 @@ class Tool:
 
 
 # ---------------------------------------------------------------------------
-# 工作目录围栏（迭代 1 已有，保持不变）
+# 工作目录围栏（迭代 1 引入；迭代 3 起作为权限闸门 0 的决策依据）
 # ---------------------------------------------------------------------------
 
 def safe_path(raw: str) -> Path:
-    """把工具参数里的路径解析为 cwd 内的绝对路径，越界即抛 ToolError。"""
+    """把工具参数里的路径解析为 cwd 内的绝对路径，越界即抛 ToolError。
+
+    迭代 3 起，路径围栏作为权限管线的闸门 0 生效（_path_fence_check）；
+    handler 内的调用保留为纵深防御。
+    """
     if not raw or not raw.strip():
         raise ToolError("path 不能为空")
     root = Path.cwd().resolve()
     p = (root / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
     if not p.is_relative_to(root):
-        raise ToolError(f"路径越界：{raw} 不在工作目录 {root} 内（迭代 3 将引入完整权限管线）")
+        raise ToolError(f"路径越界：{raw} 不在工作目录 {root} 内")
     return p
+
+
+# ---------------------------------------------------------------------------
+# 权限钩子（闸门 0：工具自带硬边界，迭代 3）
+# ---------------------------------------------------------------------------
+
+def _path_fence_check(args: dict) -> "PermissionResult | None":
+    """文件工具的路径围栏：越界 → deny；界内 → None（交给通用闸门）。"""
+    raw = args.get("path") or "."
+    try:
+        safe_path(raw)
+    except ToolError as e:
+        return PermissionResult(Behavior.DENY, str(e))
+    return None
+
+
+def _glob_pattern_check(args: dict) -> "PermissionResult | None":
+    """glob 模式越界：pattern 含 '..' 或绝对路径 → deny。"""
+    pattern = str(args.get("pattern", ""))
+    if ".." in pattern or pattern.startswith("/"):
+        return PermissionResult(Behavior.DENY, f"glob 模式越界: {pattern!r}")
+    return None
+
+
+def _grep_permission_check(args: dict) -> "PermissionResult | None":
+    """grep = 路径围栏 + glob 参数检查。"""
+    fence = _path_fence_check(args)
+    if fence is not None:
+        return fence
+    glob_arg = str(args.get("glob", ""))
+    if ".." in glob_arg:
+        return PermissionResult(Behavior.DENY, f"grep glob 参数越界: {glob_arg!r}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -181,21 +228,26 @@ def _glob_files(args: dict) -> str:
 
 # ---- 迭代 2 新增：bash ----
 
-# 临时危险命令黑名单（迭代 3 的三道闸门权限管线将替换它）
+# 危险命令黑名单（迭代 3：从 handler 前移为权限闸门 0 的硬拒决策）
 _BLOCKED_BASH_PATTERNS = (
     "rm -rf /", "rm -rf ~", "sudo ", "mkfs", "shutdown", "reboot",
     "dd if=", ":(){", " > /dev/",
 )
 
 
-def _bash(args: dict) -> str:
-    command = args["command"]
+def _bash_permission_check(args: dict) -> "PermissionResult | None":
+    """bash 的硬边界：黑名单命令 → deny；其余 → None（交给通用闸门）。"""
+    command = str(args.get("command", ""))
     for pattern in _BLOCKED_BASH_PATTERNS:
         if pattern in command:
-            raise ToolError(
-                f"命令被安全黑名单拦截: {command!r}（命中 {pattern!r}；"
-                f"迭代 3 将引入完整权限管线）"
+            return PermissionResult(
+                Behavior.DENY, f"命令命中安全黑名单: {command!r}（命中 {pattern!r}）"
             )
+    return None
+
+
+def _bash(args: dict) -> str:
+    command = args["command"]
     timeout = min(int(args.get("timeout", BASH_TIMEOUT_DEFAULT)), BASH_TIMEOUT_MAX)
     started = time.perf_counter()
     try:
@@ -325,6 +377,7 @@ def default_tools() -> list[Tool]:
             handler=_read_file,
             is_concurrency_safe=True,
             is_read_only=True,
+            check_permissions=_path_fence_check,
         ),
         Tool(
             name="write_file",
@@ -338,6 +391,7 @@ def default_tools() -> list[Tool]:
                 "required": ["path", "content"],
             },
             handler=_write_file,
+            check_permissions=_path_fence_check,
         ),
         Tool(
             name="edit_file",
@@ -356,6 +410,7 @@ def default_tools() -> list[Tool]:
                 "required": ["path", "old_string", "new_string"],
             },
             handler=_edit_file,
+            check_permissions=_path_fence_check,
         ),
         Tool(
             name="list_dir",
@@ -384,6 +439,7 @@ def default_tools() -> list[Tool]:
             handler=_glob_files,
             is_concurrency_safe=True,
             is_read_only=True,
+            check_permissions=_glob_pattern_check,
         ),
         Tool(
             name="grep",
@@ -400,6 +456,7 @@ def default_tools() -> list[Tool]:
             handler=_grep,
             is_concurrency_safe=True,
             is_read_only=True,
+            check_permissions=_grep_permission_check,
         ),
         Tool(
             name="bash",
@@ -417,5 +474,6 @@ def default_tools() -> list[Tool]:
             },
             handler=_bash,
             max_result_chars=12000,  # 工具级预算：命令输出往往比文件读取大（CC Bash 为 30_000）
+            check_permissions=_bash_permission_check,
         ),
     ]

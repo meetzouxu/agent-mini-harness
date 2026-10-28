@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .tools import Tool, ToolError
+from .permissions import Behavior, PermissionManager, PermissionResult
 
 # ---- ANSI 颜色（macOS/Linux 终端） ----
 _DIM = "\033[2m"
@@ -94,6 +95,7 @@ class Agent:
         verbose: bool = True,
         model: str = "deepseek-chat",
         max_workers: int = 4,
+        permission_manager: PermissionManager | None = None,
     ) -> None:
         self.client = client
         self.tools: dict[str, Tool] = {t.name: t for t in tools}
@@ -102,6 +104,8 @@ class Agent:
         self.verbose = verbose
         self.model = model
         self.max_workers = max_workers
+        # 迭代 3：权限管理器；未提供时行为与迭代 2 完全一致（兼容旧测试）
+        self.permissions = permission_manager
         # 并发执行工具时，终端打印需要互斥，避免多线程输出交错撕裂
         self._print_lock = threading.Lock()
 
@@ -195,13 +199,22 @@ class Agent:
             return tool is not None and tool.is_concurrency_safe
 
         if len(tool_calls) > 1 and all(_is_safe(tc) for tc in tool_calls):
-            self._say(f"{_DIM}⚡ {len(tool_calls)} 个只读工具 → 并发执行{_RESET}")
-            with ThreadPoolExecutor(
-                max_workers=min(self.max_workers, len(tool_calls))
-            ) as pool:
-                futures = [
-                    pool.submit(self._execute_tool_call, turn, tc) for tc in tool_calls
-                ]
+            # 迭代 3 补充：并发批次里任何一个可能触发 ask 交互 → 整批串行化
+            # （交互回调只能串行调用，避免多个确认弹窗交错）
+            if self.permissions is None or not any(
+                self.permissions.peek(
+                    self.tools[tc.function.name], _parse_args_for_check(tc)
+                ).behavior
+                is Behavior.ASK
+                for tc in tool_calls
+            ):
+                self._say(f"{_DIM}⚡ {len(tool_calls)} 个只读工具 → 并发执行{_RESET}")
+                with ThreadPoolExecutor(
+                    max_workers=min(self.max_workers, len(tool_calls))
+                ) as pool:
+                    futures = [
+                        pool.submit(self._execute_tool_call, turn, tc) for tc in tool_calls
+                    ]
                 return [fut.result() for fut in futures]  # futures 按提交序 → 结果天然保序
 
         return [self._execute_tool_call(turn, tc) for tc in tool_calls]
@@ -221,9 +234,9 @@ class Agent:
     def _execute_tool_call(self, turn: int, tc: Any) -> ToolEvent:
         """执行单个 tool_call。
 
-        任何失败（JSON 解析失败/未知工具/参数错误/运行异常）都不抛出，
-        而是转成错误文本作为观察结果回填 —— 模型读到错误后可自行修正重试。
-        这对应 claude-code「错误即时恢复」的设计。
+        迭代 3：执行前先过权限管线（闸门 0 硬边界 → deny 规则 → allow/ask 规则
+        → 模式默认）。deny 的结果文本直接作为观察回填（模型读到后可改变策略），
+        ask 由 on_ask 回调裁决。任何失败都不抛出，循环永不因工具问题崩溃。
         """
         name = tc.function.name
         started = time.perf_counter()
@@ -234,6 +247,16 @@ class Agent:
             tool = self.tools.get(name)
             if tool is None:
                 raise ToolError(f"未知工具: {name}（可用: {', '.join(self.tools)}）")
+
+            # ---- 迭代 3：权限裁决（在参数校验之后、执行之前） ----
+            if self.permissions is not None:
+                decision = self.permissions.decide(tool, arguments)
+                if decision.behavior is Behavior.DENY:
+                    raise ToolError(f"[权限拒绝] {decision.reason}")
+                self._say(
+                    f"  {_YELLOW}🔒 {decision.behavior.value}({_DIM}{decision.reason}{_RESET}{_YELLOW}){_RESET}"
+                )
+
             result = tool.run(arguments)
             is_error = False
         except ToolError as e:
@@ -288,3 +311,12 @@ def _is_json(raw: str | None) -> bool:
         return True
     except (json.JSONDecodeError, TypeError):
         return False
+
+
+def _parse_args_for_check(tc: Any) -> dict:
+    """并发预检时安全解析参数（解析失败 → 空字典，串行路径会再报错）。"""
+    try:
+        args = json.loads(tc.function.arguments or "{}")
+        return args if isinstance(args, dict) else {}
+    except json.JSONDecodeError:
+        return {}

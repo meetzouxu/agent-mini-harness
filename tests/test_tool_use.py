@@ -103,10 +103,14 @@ class BashToolTests(unittest.TestCase):
         self.assertIn("超时", str(ctx.exception))
 
     def test_dangerous_pattern_blocked(self):
+        """迭代 3：黑名单前移到权限层闸门 0，bypass 模式也拦截。"""
+        from mini_agent.permissions import Behavior, PermissionManager
+
+        pm = PermissionManager(mode="bypass")
         for cmd in ("sudo rm x", "rm -rf /", "mkfs.ext4 /dev/sda"):
-            with self.assertRaises(ToolError) as ctx:
-                self.bash.run({"command": cmd})
-            self.assertIn("黑名单", str(ctx.exception))
+            result = pm.check(self.bash, {"command": cmd})
+            self.assertIs(result.behavior, Behavior.DENY, msg=cmd)
+            self.assertIn("黑名单", result.reason)
 
     def test_runs_in_cwd(self):
         Path("marker.txt").write_text("from-bash", encoding="utf-8")
