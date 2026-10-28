@@ -1,4 +1,4 @@
-"""Agent Loop —— 迭代 1 的核心。
+"""Agent Loop —— 迭代 1 的核心；迭代 2 升级了工具分派（并发执行）。
 
 复刻 Claude Code src/query.ts queryLoop() 的最小状态机：
 
@@ -22,7 +22,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,6 +93,7 @@ class Agent:
         max_turns: int = 15,
         verbose: bool = True,
         model: str = "deepseek-chat",
+        max_workers: int = 4,
     ) -> None:
         self.client = client
         self.tools: dict[str, Tool] = {t.name: t for t in tools}
@@ -98,6 +101,9 @@ class Agent:
         self.max_turns = max_turns
         self.verbose = verbose
         self.model = model
+        self.max_workers = max_workers
+        # 并发执行工具时，终端打印需要互斥，避免多线程输出交错撕裂
+        self._print_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # 主循环
@@ -131,10 +137,10 @@ class Agent:
                 self._say(f"{_GREEN}✓ 完成{_RESET}")
                 break
 
-            # ---- 阶段 3：执行工具（行动 + 观察） ----
+            # ---- 阶段 3：执行工具（行动 + 观察，迭代 2：并发分派） ----
             self._say(f"{_DIM}── turn {state.turn_count + 1} ──────────────────────{_RESET}")
-            for tc in tool_calls:
-                event = self._execute_tool_call(state.turn_count + 1, tc)
+            events = self._dispatch_tool_calls(state.turn_count + 1, tool_calls)
+            for tc, event in zip(tool_calls, events):
                 tool_events.append(event)
                 tool_calls_count += 1
                 state.messages.append(
@@ -165,6 +171,40 @@ class Agent:
             messages=state.messages,
             tool_events=tool_events,
         )
+
+    # ------------------------------------------------------------------
+    # 工具分派（迭代 2 新增）
+    # ------------------------------------------------------------------
+
+    def _dispatch_tool_calls(self, turn: int, tool_calls: list[Any]) -> list[ToolEvent]:
+        """分派本轮所有 tool_calls —— 对应 claude-code runTools() 的并发判定。
+
+        策略（教学版，保序优先）：
+        - 本轮全部工具都 is_concurrency_safe（只读无副作用）→ 线程池并发执行
+        - 只要有一个不安全（写/改/命令）→ 全部串行，保持原始顺序
+
+        为什么「全或无」而不是「只读并发 + 写串行」：若同一轮里 read 和 write
+        指向同一文件，重排序会改变 read 看到的内容（读到写前还是写后）。
+        全或无策略保证：只要可能出现写，行为就与串行完全一致。
+
+        无论并发还是串行，事件列表都按 tool_calls 原始顺序返回 ——
+        API 协议要求每个 tool_call_id 都有对应的 tool 消息，按原序回填最稳妥。
+        """
+        def _is_safe(tc: Any) -> bool:
+            tool = self.tools.get(tc.function.name)
+            return tool is not None and tool.is_concurrency_safe
+
+        if len(tool_calls) > 1 and all(_is_safe(tc) for tc in tool_calls):
+            self._say(f"{_DIM}⚡ {len(tool_calls)} 个只读工具 → 并发执行{_RESET}")
+            with ThreadPoolExecutor(
+                max_workers=min(self.max_workers, len(tool_calls))
+            ) as pool:
+                futures = [
+                    pool.submit(self._execute_tool_call, turn, tc) for tc in tool_calls
+                ]
+                return [fut.result() for fut in futures]  # futures 按提交序 → 结果天然保序
+
+        return [self._execute_tool_call(turn, tc) for tc in tool_calls]
 
     # ------------------------------------------------------------------
     # 子步骤
@@ -233,7 +273,8 @@ class Agent:
 
     def _say(self, text: str) -> None:
         if self.verbose:
-            print(text)
+            with self._print_lock:  # 并发执行时避免多线程打印交错撕裂
+                print(text)
 
     @staticmethod
     def _brief(text: str | None, limit: int = 60) -> str:

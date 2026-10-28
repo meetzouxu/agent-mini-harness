@@ -32,7 +32,7 @@
 | # | 主题 | 核心内容 | 对应 Claude Code 概念 |
 |---|------|---------|----------------------|
 | 1 | **Agent Loop** ✅ | while 循环：调模型 → 执行 tool_calls → 回填 tool 消息 → 继续/终止；max_turns 熔断；工具错误回填不崩溃 | `query.ts queryLoop()`、`needsFollowUp`、`State` |
-| 2 | **工具编排 Tool Use** | 工具注册表查表分发；扩展工具集（bash / edit_file / grep）；`isConcurrencySafe` 只读并发判断（`ls` 可并发、`rm` 独占）；buildTool() 独立对象封装 schema/验证/执行 | `TOOL_HANDLERS` 查表、`buildTool()`、`getAllBaseTools()` |
+| 2 | **工具编排 Tool Use** ✅ | 查表分发 + 参数校验（required/类型，对应 validateInput）；扩展至 7 工具（bash/edit_file/grep）；`is_concurrency_safe` 只读并发判定（全或无策略：全只读批次线程池并发，混写批次全串行保序） | `TOOL_HANDLERS` 查表、`buildTool()`、`isConcurrencySafe` |
 | 3 | **权限管线 Permission** | 三道闸门：拒绝列表（硬拒）→ 规则匹配（软询问）→ 用户审批；`allow/deny/ask/passthrough` 四态；写工作区外需确认（替换迭代 1 的粗围栏）；分层配置（用户级/项目级/会话级） | `hasPermissionsToUseToolInner`、`permission-model.mdx`、PermissionResult 四态 |
 | 4 | **Hooks 扩展点** | 四事件注册表：`UserPromptSubmit / PreToolUse / PostToolUse / Stop`；权限检查从循环体移到 hook；Stop hook 返回字符串可强制续跑；`stopHookActive` 防无限循环 | 27 个 hook 事件、`HookResult` 14 字段 |
 
@@ -99,5 +99,6 @@
 
 ## 当前状态
 
-- 迭代 1 ✅ 已完成并双重验证：① 10 个单测通过；② 2026-10-27 真实运行（DeepSeek，3 轮 5 工具调用 completed，含空参数工具调用与结果预算截断的实测）。详见 [iterations/01-agent-loop.md](iterations/01-agent-loop.md)（含 response/state 字段解剖）
-- 路线图 2026-10-27 定稿：8 阶段 23 次迭代
+- 迭代 1 ✅ Agent Loop：10 单测 + DeepSeek 真实运行验证。详见 [iterations/01-agent-loop.md](iterations/01-agent-loop.md)（含 response/state 字段解剖）
+- 迭代 2 ✅ 工具编排：7 内置工具 + 参数校验 + 并发分派，24 新单测（全套 34 个通过）。详见 [iterations/02-tool-use.md](iterations/02-tool-use.md)
+- 下一步：迭代 3 权限管线（三道闸门 + 四态 PermissionResult，替换 bash 黑名单）

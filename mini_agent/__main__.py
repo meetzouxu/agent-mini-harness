@@ -16,11 +16,12 @@ from .llm import build_client
 from .tools import default_tools
 
 DEFAULT_SYSTEM_PROMPT = """\
-你是 mini-agent，一个运行在终端里的编码助手，通过工具读写文件完成任务。
+你是 mini-agent，一个运行在终端里的编码助手，通过工具读写文件、搜索代码、执行命令来完成任务。
 
 规则：
 1. 调用工具前先想清楚参数；能用一次工具完成的不要拆成多次。
 2. 工具返回错误时，仔细阅读错误信息、修正参数后重试，不要放弃。
+   特别是 edit_file：old_string 必须唯一，报错不唯一时扩大上下文重试。
 3. 任务完成后，用简洁的中文总结你做了什么、改了哪些文件。
 4. 所有文件路径都相对当前工作目录。
 """
@@ -29,7 +30,7 @@ DEFAULT_SYSTEM_PROMPT = """\
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mini-agent",
-        description="迭代 1：最小 Agent Loop（DeepSeek + 工具调用）",
+        description="迭代 2：工具编排（7 个内置工具 + 并发分派）",
     )
     parser.add_argument("prompt", help="任务描述，例如：统计当前目录下有几个 .py 文件并写入 report.md")
     parser.add_argument("--max-turns", type=int, default=None, help="最大循环轮次（默认读 .env 或 15）")
