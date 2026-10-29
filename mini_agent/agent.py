@@ -30,6 +30,14 @@ from typing import Any
 
 from .tools import Tool, ToolError
 from .permissions import Behavior, PermissionManager, PermissionResult
+from .hooks import (
+    EVENT_POST_TOOL_USE,
+    EVENT_PRE_TOOL_USE,
+    EVENT_STOP,
+    EVENT_USER_PROMPT_SUBMIT,
+    HookRegistry,
+    HookResult,
+)
 
 # ---- ANSI 颜色（macOS/Linux 终端） ----
 _DIM = "\033[2m"
@@ -96,6 +104,7 @@ class Agent:
         model: str = "deepseek-chat",
         max_workers: int = 4,
         permission_manager: PermissionManager | None = None,
+        hooks: HookRegistry | None = None,
     ) -> None:
         self.client = client
         self.tools: dict[str, Tool] = {t.name: t for t in tools}
@@ -106,6 +115,8 @@ class Agent:
         self.max_workers = max_workers
         # 迭代 3：权限管理器；未提供时行为与迭代 2 完全一致（兼容旧测试）
         self.permissions = permission_manager
+        # 迭代 4：hook 注册表；未提供时四个触发点均为空操作（兼容旧测试）
+        self.hooks = hooks or HookRegistry()
         # 并发执行工具时，终端打印需要互斥，避免多线程输出交错撕裂
         self._print_lock = threading.Lock()
 
@@ -123,6 +134,33 @@ class Agent:
         tool_events: list[ToolEvent] = []
         tool_calls_count = 0
         final_text = ""
+        # 迭代 4：Stop hook 防循环护栏（对应 CC stopHookActive）——
+        # 只允许续跑一次；第二次 Stop 触发时忽略 force_continue
+        stop_hook_active = False
+
+        # ---- 迭代 4：UserPromptSubmit（任务提交后、调模型前） ----
+        upr = self.hooks.trigger(
+            EVENT_USER_PROMPT_SUBMIT, {"prompt": prompt, "messages": state.messages}
+        )
+        if upr.system_message:
+            self._say(f"{_YELLOW}⚠ {upr.system_message}{_RESET}")
+        if upr.additional_context:
+            state.messages.append(
+                {"role": "user", "content": upr.additional_context}
+            )
+            self._say(f"{_DIM}📌 UserPromptSubmit 注入上下文{_RESET}")
+        if not upr.continue_:
+            self._say(f"{_RED}✗ UserPromptSubmit hook 拦截任务: {upr.stop_reason}{_RESET}")
+            return RunResult(
+                final_text=f"任务被 UserPromptSubmit hook 拦截: {upr.stop_reason or '未提供原因'}",
+                stop_reason="hook_blocked",
+                turn_count=0,
+                tool_calls_count=0,
+                input_tokens=0,
+                output_tokens=0,
+                messages=state.messages,
+                tool_events=[],
+            )
 
         while True:
             # ---- 阶段 2：调用模型（思考） ----
@@ -136,6 +174,20 @@ class Agent:
 
             if not tool_calls:
                 # ---- 阶段 4：终止（claude-code 的 needsFollowUp = False） ----
+                # 迭代 4：Stop hook（终止前）——force_continue 可注入消息强制续跑
+                sr = self.hooks.trigger(
+                    EVENT_STOP,
+                    {"messages": state.messages, "final_text": message.content or ""},
+                )
+                if sr.system_message:
+                    self._say(f"{_YELLOW}⚠ {sr.system_message}{_RESET}")
+                if sr.force_continue and not stop_hook_active:
+                    stop_hook_active = True  # 护栏置位：只允许续跑一次
+                    self._say(
+                        f"{_YELLOW}↻ Stop hook 强制续跑: {sr.force_continue}{_RESET}"
+                    )
+                    state.messages.append({"role": "user", "content": sr.force_continue})
+                    continue
                 state.stop_reason = "completed"
                 final_text = message.content or ""
                 self._say(f"{_GREEN}✓ 完成{_RESET}")
@@ -219,6 +271,35 @@ class Agent:
 
         return [self._execute_tool_call(turn, tc) for tc in tool_calls]
 
+    def _permission_with_hook(
+        self, tool: Tool, arguments: dict, pre: "HookResult"
+    ) -> PermissionResult:
+        """融合 PreToolUse hook 决策与权限管线（迭代 4）。
+
+        融合规则（CC 同款：hook allow 不能凌驾系统边界）：
+        - hook deny → 直接 DENY（hook 可加严，不可放宽）
+        - hook ask → 权限结果升为 ASK（若本为 allow）
+        - hook allow → 仅当权限结果为 ask 时免除询问；deny（黑名单/规则）不变
+        - hook None → 原样返回权限结果
+        """
+        decision = self.permissions.check(tool, arguments)
+        hb = pre.permission_behavior
+        if hb == "deny":
+            return PermissionResult(
+                Behavior.DENY,
+                pre.stop_reason or "PreToolUse hook 拒绝",
+            )
+        if hb == "ask" and decision.behavior is Behavior.ALLOW:
+            decision = PermissionResult(Behavior.ASK, "PreToolUse hook 要求确认")
+        if hb == "allow" and decision.behavior is Behavior.ASK:
+            decision = PermissionResult(Behavior.ALLOW, "PreToolUse hook 免除询问")
+        if decision.behavior is Behavior.DENY:
+            return decision  # 走 decide 的拒绝记录链路
+        if decision.behavior is Behavior.ALLOW:
+            self.permissions._record_success(tool.name)
+            return decision
+        return self.permissions.decide(tool, arguments)  # ask → 走交互
+
     # ------------------------------------------------------------------
     # 子步骤
     # ------------------------------------------------------------------
@@ -234,9 +315,12 @@ class Agent:
     def _execute_tool_call(self, turn: int, tc: Any) -> ToolEvent:
         """执行单个 tool_call。
 
-        迭代 3：执行前先过权限管线（闸门 0 硬边界 → deny 规则 → allow/ask 规则
-        → 模式默认）。deny 的结果文本直接作为观察回填（模型读到后可改变策略），
-        ask 由 on_ask 回调裁决。任何失败都不抛出，循环永不因工具问题崩溃。
+        迭代 4 完整链路：PreToolUse hook → 权限管线 → 执行 → PostToolUse hook。
+        - PreToolUse 在权限裁决**之前**（hook 可拦截/改参数，也可提前 allow/deny）；
+          但 hook 的 allow 不能绕过 deny 规则与黑名单（CC 同款：hook allow 只能
+          免询问，不能凌驾系统硬边界）
+        - PostToolUse 在成功路径上触发，可改写输出/注入上下文
+        任何失败都不抛出，循环永不因工具问题崩溃。
         """
         name = tc.function.name
         started = time.perf_counter()
@@ -248,9 +332,29 @@ class Agent:
             if tool is None:
                 raise ToolError(f"未知工具: {name}（可用: {', '.join(self.tools)}）")
 
+            # ---- 迭代 4：PreToolUse hook（权限之前） ----
+            pre = self.hooks.trigger(
+                EVENT_PRE_TOOL_USE,
+                {"tool_name": name, "arguments": arguments, "turn": turn},
+            )
+            if pre.system_message:
+                self._say(f"{_YELLOW}⚠ {pre.system_message}{_RESET}")
+            if not pre.continue_:
+                raise ToolError(
+                    f"[PreToolUse 拦截] {pre.stop_reason or 'hook 未提供原因'}"
+                )
+            if pre.updated_input is not None:
+                if not isinstance(pre.updated_input, dict):
+                    raise ToolError("[PreToolUse 拦截] updated_input 必须是对象")
+                arguments = pre.updated_input  # 改写参数后继续走权限/校验
+                self._say(f"{_DIM}✎ PreToolUse 改写参数{_RESET}")
+            if pre.additional_context:
+                # CC 语义：注入为下一条用户消息；教学版直接拼进工具结果旁的说明
+                self._say(f"{_DIM}📌 PreToolUse 附加上下文: {self._brief(pre.additional_context)}{_RESET}")
+
             # ---- 迭代 3：权限裁决（在参数校验之后、执行之前） ----
             if self.permissions is not None:
-                decision = self.permissions.decide(tool, arguments)
+                decision = self._permission_with_hook(tool, arguments, pre)
                 if decision.behavior is Behavior.DENY:
                     raise ToolError(f"[权限拒绝] {decision.reason}")
                 self._say(
@@ -267,6 +371,26 @@ class Agent:
             result, is_error = f"[工具异常] {type(e).__name__}: {e}", True
 
         duration_ms = (time.perf_counter() - started) * 1000
+
+        # ---- 迭代 4：PostToolUse hook（成功路径，可改写输出/注入上下文） ----
+        if not is_error:
+            post = self.hooks.trigger(
+                EVENT_POST_TOOL_USE,
+                {
+                    "tool_name": name,
+                    "arguments": arguments,
+                    "result": result,
+                    "duration_ms": duration_ms,
+                    "turn": turn,
+                },
+            )
+            if post.system_message:
+                self._say(f"{_YELLOW}⚠ {post.system_message}{_RESET}")
+            if post.updated_output is not None:
+                result = post.updated_output  # 改写回填给模型的观察文本
+            if post.additional_context:
+                result = f"{result}\n[hook 上下文] {post.additional_context}"
+
         self._say(
             f"{_CYAN}⟳ {name}{_RESET} {_DIM}{self._brief(tc.function.arguments)}{_RESET}"
         )

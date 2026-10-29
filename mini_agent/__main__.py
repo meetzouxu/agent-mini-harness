@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .agent import Agent, RunResult
 from .config import load_config
+from .hooks import EVENT_POST_TOOL_USE, EVENT_PRE_TOOL_USE, Hook, HookRegistry, HookResult
 from .llm import build_client
 from .permissions import (
     ANSWER_ALWAYS,
@@ -42,6 +43,57 @@ DEFAULT_SYSTEM_PROMPT = """\
 """
 
 _VALID_MODES = ("default", "plan", "acceptEdits", "bypass")
+
+# 工具结果超过该字符数时 PostToolUse hook 发出告警（迭代 15 日志监控的伏笔）
+LARGE_OUTPUT_WARN_CHARS = 6000
+
+
+def _builtin_hooks() -> HookRegistry:
+    """内置示例 hooks（迭代 4）：两个有实际价值的示范。
+
+    1. PreToolUse 守卫 .env —— 密钥文件不允许任何工具读写（除 read 白名单外
+       全 deny）：密钥安全是 Agent 工程的硬边界示范
+    2. PostToolUse 大输出告警 —— 结果超阈值时 system_message 提醒用户，
+       为迭代 6 压缩与迭代 15 日志监控埋伏笔
+    """
+    registry = HookRegistry()
+
+    def guard_env_file(payload: dict) -> HookResult:
+        path = str(payload.get("arguments", {}).get("path", ""))
+        if path == ".env" or path.endswith("/.env"):
+            return HookResult.deny(f"禁止访问密钥文件 {path}（.env 存放 API key）")
+        return HookResult()
+
+    def warn_large_output(payload: dict) -> HookResult:
+        result = str(payload.get("result", ""))
+        if len(result) > LARGE_OUTPUT_WARN_CHARS:
+            return HookResult(
+                system_message=(
+                    f"工具 {payload.get('tool_name')} 输出 {len(result)} 字符，"
+                    f"超过 {LARGE_OUTPUT_WARN_CHARS}——建议缩小范围或用更精确的模式"
+                )
+            )
+        return HookResult()
+
+    registry.register(
+        Hook(
+            event=EVENT_PRE_TOOL_USE,
+            name="guard-env-file",
+            handler=guard_env_file,
+            matcher="write_file|edit_file",
+            source="builtin",
+        )
+    )
+    registry.register(
+        Hook(
+            event=EVENT_POST_TOOL_USE,
+            name="warn-large-output",
+            handler=warn_large_output,
+            matcher="*",
+            source="builtin",
+        )
+    )
+    return registry
 
 
 def _terminal_ask(tool_name: str, arguments: dict, reason: str) -> str:
@@ -71,7 +123,7 @@ def _auto_deny_ask(tool_name: str, arguments: dict, reason: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mini-agent",
-        description="迭代 3：权限管线（三道闸门 + 四态裁决 + Denial Tracking）",
+        description="迭代 4：Hooks 扩展点（四事件 + 拦截/改写/注入/续跑）",
     )
     parser.add_argument("prompt", help="任务描述，例如：统计当前目录下有几个 .py 文件并写入 report.md")
     parser.add_argument("--max-turns", type=int, default=None, help="最大循环轮次（默认读 .env 或 15）")
@@ -105,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
         mode = args.permission_mode
         on_ask = _terminal_ask
     permissions = PermissionManager(mode=mode, rules=rules, on_ask=on_ask)
+    hooks = _builtin_hooks()
 
     agent = Agent(
         client=client,
@@ -114,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         verbose=not args.quiet,
         model=cfg.model,
         permission_manager=permissions,
+        hooks=hooks,
     )
 
     result: RunResult = agent.run(args.prompt)

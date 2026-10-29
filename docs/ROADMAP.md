@@ -34,7 +34,7 @@
 | 1 | **Agent Loop** ✅ | while 循环：调模型 → 执行 tool_calls → 回填 tool 消息 → 继续/终止；max_turns 熔断；工具错误回填不崩溃 | `query.ts queryLoop()`、`needsFollowUp`、`State` |
 | 2 | **工具编排 Tool Use** ✅ | 查表分发 + 参数校验（required/类型，对应 validateInput）；扩展至 7 工具（bash/edit_file/grep）；`is_concurrency_safe` 只读并发判定（全或无策略：全只读批次线程池并发，混写批次全串行保序） | `TOOL_HANDLERS` 查表、`buildTool()`、`isConcurrencySafe` |
 | 3 | **权限管线 Permission** ✅ | 三道闸门：工具硬边界（黑名单/围栏）→ deny 规则 → allow/ask 规则 → 模式默认；allow/deny/ask/passthrough 四态；四模式表（default/plan/acceptEdits/bypass）；Denial Tracking（连续 3 次/总 20 次）；分层配置（settings/cli/session） | `hasPermissionsToUseToolInner`、`permission-model.mdx`、PermissionResult 四态 |
-| 4 | **Hooks 扩展点** | 四事件注册表：`UserPromptSubmit / PreToolUse / PostToolUse / Stop`；权限检查从循环体移到 hook；Stop hook 返回字符串可强制续跑；`stopHookActive` 防无限循环 | 27 个 hook 事件、`HookResult` 14 字段 |
+| 4 | **Hooks 扩展点** ✅ | 四事件注册表：`UserPromptSubmit / PreToolUse / PostToolUse / Stop`；HookResult 四能力（拦截/改写/注入/续跑）；结果合并语义（最严格优先）；hook allow 不能凌驾系统边界；`stop_hook_active` 护栏防无限续跑 | 27 个 hook 事件、`HookResult` 14 字段 |
 
 ### 阶段二：上下文工程
 
@@ -102,4 +102,5 @@
 - 迭代 1 ✅ Agent Loop：10 单测 + DeepSeek 真实运行验证。详见 [iterations/01-agent-loop.md](iterations/01-agent-loop.md)（含 response/state 字段解剖）
 - 迭代 2 ✅ 工具编排：7 内置工具 + 参数校验 + 并发分派，24 新单测（全套 34 个通过）。详见 [iterations/02-tool-use.md](iterations/02-tool-use.md)
 - 迭代 3 ✅ 权限管线：三道闸门 + 四态裁决 + 四模式 + Denial Tracking + settings 分层配置，29 新单测（全套 63 个通过）。详见 [iterations/03-permissions.md](iterations/03-permissions.md)
-- 下一步：迭代 4 Hooks 扩展点（四事件注册表，权限检查移入 PreToolUse）
+- 迭代 4 ✅ Hooks 扩展点：四事件 + 四能力 + 合并语义 + hook/权限融合 + 防循环护栏，22 新单测（全套 84 个通过）。详见 [iterations/04-hooks.md](iterations/04-hooks.md)
+- 下一步：迭代 5 维护上下文（多轮 REPL 会话 + System Prompt 分段组装）
