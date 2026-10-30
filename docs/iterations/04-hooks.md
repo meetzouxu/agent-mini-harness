@@ -66,7 +66,84 @@ class HookResult:
 
 **hook 异常永不打断主循环**：捕获 → `system_message` 警告 → 继续（CC 同款原则）。
 
+`trigger()` 内部流程（匹配 → 逐个执行 → 异常隔离 → 合并）：
+
+```mermaid
+flowchart TD
+    T["trigger(event, payload)"] --> M["get_matching(event, tool_name)<br/>按注册序过滤（matcher 匹配）"]
+    M --> E{"匹配集为空?"}
+    E -->|是| N["返回空 HookResult<br/>(不干预，四个能力全 None)"]
+    E -->|否| LOOP["按注册序逐个执行 hook"]
+    LOOP --> OK{"hook 正常返回?"}
+    OK -->|是| COLLECT["收集 HookResult"]
+    OK -->|"异常(任何类型)"| WARN["转 system_message 警告『已忽略』<br/>结果等价于空 HookResult"]
+    WARN --> MORE
+    COLLECT --> MORE{"还有下一个 hook?"}
+    MORE -->|是| LOOP
+    MORE -->|否| MERGE["_merge_results 合并"]
+    MERGE --> OUT["返回合并后的 HookResult"]
+```
+
+注意两条「永不崩」路径：匹配集为空返回空结果；单个 hook 异常被隔离成警告、
+不影响其余 hooks 执行——hook 是扩展点，扩展点的故障不能变成宿主的故障。
+
 ### 2.3 四个触发点的插入位置
+
+完整时序图（Agent 一次 run 中 hooks 与主循环、权限、模型、工具的交互顺序）：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant A as Agent.run()
+    participant R as HookRegistry
+    participant L as LLM
+    participant P as 权限管线
+    participant T as 工具
+
+    U->>A: prompt
+    A->>R: ① UserPromptSubmit
+    R-->>A: HookResult
+    alt continue_=False（拦截）
+        A-->>U: hook_blocked（零模型调用）
+    else additional_context
+        Note over A: 注入为下一条 user 消息
+    end
+    loop 每轮（思考→行动→观察）
+        A->>L: messages
+        L-->>A: tool_calls 或 文本
+        alt 无 tool_calls（准备终止）
+            A->>R: ④ Stop
+            R-->>A: force_continue?
+            alt 非空 且护栏未用
+                Note over A: 注入消息 + continue（只允许一次）
+            else 护栏已用 / 空
+                A-->>U: final_text（completed）
+            end
+        else 有 tool_calls
+            loop 每个 tool_call
+                A->>R: ② PreToolUse
+                R-->>A: 拦截 / updated_input / permission_behavior
+                alt 拦截(continue_=False)
+                    Note over A: [PreToolUse 拦截] 回填
+                else 融合裁决(_permission_with_hook)
+                    A->>P: check + hook 融合
+                    P-->>A: ALLOW / DENY / ASK→交互
+                    alt ALLOW
+                        A->>T: 执行（校验→handler→截断）
+                        T-->>A: 结果文本
+                        A->>R: ③ PostToolUse
+                        R-->>A: updated_output / 附加上下文
+                        Note over A: 最终文本回填 tool 消息
+                    else DENY
+                        Note over A: [权限拒绝] 回填（Denial Tracking）
+                    end
+                end
+            end
+        end
+    end
+```
+
+简化版伪代码（上图的骨架）：
 
 ```python
 run(prompt):

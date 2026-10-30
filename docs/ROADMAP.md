@@ -95,7 +95,8 @@
 1. `mini_agent/` 下的增量代码（不推翻上一轮，向前兼容）
 2. `tests/` 新增单测（假客户端，不烧 API key）
 3. `docs/iterations/NN-xxx.md` 拆解：动机 → 设计 → 代码讲解 → 环境与运行指令 → 与 Claude Code 概念对应关系
-4. git commit（Conventional Commits）
+4. 核心机制配 Mermaid 图（流程图/时序图，方便理解，GitHub 原生渲染）
+5. git commit（Conventional Commits）
 
 ## 当前状态
 
