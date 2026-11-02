@@ -29,7 +29,11 @@ from mini_agent.tools import ToolError, default_tools, safe_path  # noqa: E402
 # ---------------------------------------------------------------------------
 
 class FakeClient:
-    """模拟 openai.OpenAI 的 chat.completions.create 接口。"""
+    """模拟 openai.OpenAI 的 chat.completions.create 接口。
+
+    记录请求时对 messages 做快照（copy）——调用方可能原地扩展同一列表
+    （迭代 5 的 run_turn 增量模式），不做快照会让历史记录被后续修改污染。
+    """
 
     def __init__(self, responses: list):
         self.responses = list(responses)
@@ -37,7 +41,9 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
-        self.requests.append(kwargs)
+        snapshot = dict(kwargs)
+        snapshot["messages"] = [dict(m) for m in kwargs.get("messages", [])]
+        self.requests.append(snapshot)
         if not self.responses:
             raise AssertionError("脚本响应已耗尽，模型被调用了多余次数")
         return self.responses.pop(0)

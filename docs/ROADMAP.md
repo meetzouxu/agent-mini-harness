@@ -40,7 +40,7 @@
 
 | # | 主题 | 核心内容 | 对应 Claude Code 概念 |
 |---|------|---------|----------------------|
-| 5 | **维护上下文：多轮会话 + System Prompt 组装** | REPL 多轮对话（`submitMessage` 模式）；PROMPT_SECTIONS 分段（identity/tools/workspace/memory 按需拼接）；context 确定性序列化缓存；工具结果预算细化 | `QueryEngine`、`getSystemContext/getUserContext` |
+| 5 | **维护上下文：多轮会话 + System Prompt 组装** ✅ | QueryEngine 多轮会话（submitMessage 模式，messages 跨轮复用）；PROMPT_SECTIONS 分段（identity 静态 + tools/workspace 动态，BOUNDARY 分界）；确定性缓存（内容比对命中，cache_break 强制重算）；REPL 模式（/clear /stats） | `QueryEngine`、`getSystemContext/getUserContext` |
 | 6 | **上下文压缩 Compact** | 四层管线：`applyToolResultBudget`（大结果落盘）→ `snip_compact`（裁中段，保留头 3 尾 47）→ `micro_compact`（旧 tool_result 占位）→ `auto_compact`（LLM 全量摘要）；reactive compact 应急；tool_use/tool_result 配对完整性保护；3 次熔断 | `compaction.mdx`、`adjustIndexToPreserveAPIInvariants` |
 | 7 | **记忆系统 Memory** | User/Session Memory 两层；`.memory/` 目录 + MEMORY.md 索引（常驻 system prompt）；四类记忆（user/feedback/project/reference）；side-query 按需注入（≤5 条）；每轮结束提取器 + 阈值触发整理去重 | memory 子系统（两层记忆 + 索引常驻） |
 
@@ -104,4 +104,5 @@
 - 迭代 2 ✅ 工具编排：7 内置工具 + 参数校验 + 并发分派，24 新单测（全套 34 个通过）。详见 [iterations/02-tool-use.md](iterations/02-tool-use.md)
 - 迭代 3 ✅ 权限管线：三道闸门 + 四态裁决 + 四模式 + Denial Tracking + settings 分层配置，29 新单测（全套 63 个通过）。详见 [iterations/03-permissions.md](iterations/03-permissions.md)
 - 迭代 4 ✅ Hooks 扩展点：四事件 + 四能力 + 合并语义 + hook/权限融合 + 防循环护栏，22 新单测（全套 84 个通过）。详见 [iterations/04-hooks.md](iterations/04-hooks.md)
-- 下一步：迭代 5 维护上下文（多轮 REPL 会话 + System Prompt 分段组装）
+- 迭代 5 ✅ 维护上下文：QueryEngine 多轮会话 + SectionRegistry 分段组装 + 确定性缓存 + REPL，18 新单测（全套 102 个通过）。详见 [iterations/05-context.md](iterations/05-context.md)
+- 下一步：迭代 6 上下文压缩（四层管线：budget → snip → micro → auto）

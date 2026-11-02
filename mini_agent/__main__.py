@@ -28,6 +28,8 @@ from .permissions import (
     PermissionManager,
     load_settings_rules,
 )
+from .prompt import default_registry
+from .session import QueryEngine
 from .tools import default_tools
 
 DEFAULT_SYSTEM_PROMPT = """\
@@ -123,9 +125,14 @@ def _auto_deny_ask(tool_name: str, arguments: dict, reason: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="mini-agent",
-        description="迭代 4：Hooks 扩展点（四事件 + 拦截/改写/注入/续跑）",
+        description="迭代 5：多轮会话 + System Prompt 分段组装（REPL / 单次）",
     )
-    parser.add_argument("prompt", help="任务描述，例如：统计当前目录下有几个 .py 文件并写入 report.md")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="任务描述（省略则进入 REPL 多轮会话）",
+    )
     parser.add_argument("--max-turns", type=int, default=None, help="最大循环轮次（默认读 .env 或 15）")
     parser.add_argument("--quiet", action="store_true", help="安静模式：只输出最终答案（ask 一律拒绝）")
     parser.add_argument(
@@ -158,19 +165,27 @@ def main(argv: list[str] | None = None) -> int:
         on_ask = _terminal_ask
     permissions = PermissionManager(mode=mode, rules=rules, on_ask=on_ask)
     hooks = _builtin_hooks()
+    tools = default_tools()
 
+    # 迭代 5：system prompt 由 SectionRegistry 组装（identity 静态 + tools/workspace 动态）
+    # Agent 不再直接携带 system_prompt，由 QueryEngine 每轮组装并维护替换
     agent = Agent(
         client=client,
-        tools=default_tools(),
-        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        tools=tools,
+        system_prompt=None,
         max_turns=args.max_turns or cfg.max_turns,
         verbose=not args.quiet,
         model=cfg.model,
         permission_manager=permissions,
         hooks=hooks,
     )
+    registry = default_registry(tools)  # 捕获 tools 引用：工具变化 → 下轮自动反映
+    engine = QueryEngine(agent, registry)
 
-    result: RunResult = agent.run(args.prompt)
+    if args.prompt is None:
+        return _run_repl(engine)
+
+    result: RunResult = engine.submit_message(args.prompt)
 
     print()
     print("=" * 60)
@@ -182,6 +197,47 @@ def main(argv: list[str] | None = None) -> int:
         f"tokens(in/out)={result.input_tokens}/{result.output_tokens}"
     )
     return 0 if result.stop_reason == "completed" else 1
+
+
+def _run_repl(engine: QueryEngine) -> int:
+    """REPL 多轮会话（对应 claude 终端交互模式：上下文跨轮保留）。"""
+    print("mini-agent REPL —— 迭代 5 多轮会话")
+    print("命令：/clear 清空会话 · /stats 会话统计 · exit 退出")
+    while True:
+        try:
+            text = input("\nmini-agent> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not text:
+            continue
+        if text in ("exit", "quit", "/exit", "/quit"):
+            break
+        if text == "/clear":
+            engine.clear()
+            print("（已清空会话与 section 缓存）")
+            continue
+        if text == "/stats":
+            s = engine.stats
+            print(
+                f"[session] turns={s.turns} messages={engine.message_count()} "
+                f"tokens(in/out)={s.input_tokens}/{s.output_tokens} "
+                f"tool_calls={s.tool_calls} errors={s.tool_errors} "
+                f"prompt-cache-hit={engine.cache_hit_rate():.0%}"
+            )
+            continue
+        result = engine.submit_message(text)
+        print()
+        print("=" * 60)
+        print(result.final_text or "(模型未输出文本)")
+        print("=" * 60)
+        s = engine.stats
+        print(
+            f"[session] turn={s.turns} messages={engine.message_count()} "
+            f"tokens(in/out)={s.input_tokens}/{s.output_tokens} "
+            f"prompt-cache-hit={engine.cache_hit_rate():.0%}"
+        )
+    return 0
 
 
 if __name__ == "__main__":

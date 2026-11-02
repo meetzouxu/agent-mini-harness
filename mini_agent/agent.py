@@ -125,10 +125,24 @@ class Agent:
     # ------------------------------------------------------------------
 
     def run(self, prompt: str) -> RunResult:
-        """执行一次完整的 Agentic Loop：输入任务，输出最终结果。"""
-        state = LoopState()
+        """一次性模式：新建对话历史执行一轮完整 Agent Loop。
+
+        （对应 claude -p "..." 的单次任务模式。）
+        """
+        messages: list[dict[str, Any]] = []
         if self.system_prompt:
-            state.messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "system", "content": self.system_prompt})
+        return self.run_turn(messages, prompt)
+
+    def run_turn(self, messages: list[dict[str, Any]], prompt: str) -> RunResult:
+        """在一组已有对话历史上执行一轮完整 Agent Loop（迭代 5 新增）。
+
+        对应 CC 多轮会话的 submitMessage 链路：messages 由调用方
+        （QueryEngine）持有并跨轮复用——上一轮的 user/assistant/tool
+        消息全部保留，这就是「维护上下文」的机制本质。
+        本方法原地扩展 messages；每轮的 max_turns 独立计数。
+        """
+        state = LoopState(messages=messages)
         state.messages.append({"role": "user", "content": prompt})
 
         tool_events: list[ToolEvent] = []
