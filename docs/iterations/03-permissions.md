@@ -71,44 +71,74 @@ def check(self, tool, arguments):      # 纯函数，可安全并发调用
 
 ```mermaid
 flowchart TD
-    S["turn 内收到 N 个 tool_calls"] --> PK{"并发预检 peek()<br/>(check 纯函数，无副作用)"}
-    PK -->|"全部只读且无 ask"| PAR["ThreadPoolExecutor 并发执行<br/>(每个仍走完整 decide 裁决)"]
-    PK -->|"含 ask 或有写操作 / 未知工具"| SER["串行逐个执行(保序)"]
+    subgraph AGENT["agent.py · 分派与回填"]
+        S["turn 内收到 N 个 tool_calls"] --> PK{"并发预检 peek()<br/>(check 纯函数，无副作用)"}
+        PK -->|"全部只读且无 ask"| PAR["ThreadPoolExecutor 并发执行<br/>(每个仍走完整 decide 裁决)"]
+        PK -->|"含 ask 或有写操作 / 未知工具"| SER["串行逐个执行(保序)"]
+        B["解析参数 · 查表得 Tool"]
+        EXEC["validate → 执行 → 截断"]
+        FB1["tool 消息回填(结果文本)"]
+        FB2["[权限拒绝] 原因文本回填"]
+        NEXT["模型读到观察结果<br/>下一轮: 继续 / 修正参数 / 换一条路"]
+        FB1 --> NEXT
+        FB2 --> NEXT
+    end
+
+    subgraph PERM["permissions.py · 权限管线(PermissionManager)"]
+        P["decide(tool, args)"]
+        G0{"闸门 0<br/>调用 Tool.check_permissions"}
+        G1{"闸门 1 · deny 规则"}
+        G2{"闸门 2 · allow 规则"}
+        G3{"闸门 2 · ask 规则"}
+        G4{"闸门 3 · 模式默认表<br/>default / plan / acceptEdits / bypass"}
+        DENY["DENY"]
+        ALLOW["ALLOW"]
+        ASK["ASK"]
+        SR["写入会话级规则<br/>(进程结束即失效)"]
+        DT["Denial Tracking<br/>同工具连续 3 次 → 注入「改变策略」<br/>总 20 次 → 建议终止<br/>(成功一次即清零)"]
+        G1 -->|"命中(压过一切 allow)"| DENY
+        G1 -->|"未命中"| G2
+        G2 -->|"命中"| ALLOW
+        G2 -->|"未命中"| G3
+        G3 -->|"命中"| ASK
+        G3 -->|"未命中"| G4
+        G4 -->|"只读 / bypass /<br/>acceptEdits 工作区编辑"| ALLOW
+        G4 -->|"default 写操作 /<br/>acceptEdits 非编辑命令"| ASK
+        G4 -->|"plan 的写与 bash"| DENY
+        DENY --> DT
+    end
+
+    subgraph TOOLS["tools.py · 工具与硬边界钩子"]
+        HOOK["check_permissions 钩子<br/>bash 黑名单 / 路径围栏"]
+    end
+
+    subgraph CLI["__main__.py · 交互回调"]
+        U{"on_ask 用户交互<br/>y / a / n"}
+    end
+
     PAR --> B
     SER --> B
-
-    B["解析参数 · 查表得 Tool"] --> P["PermissionManager.decide(tool, args)"]
-
-    P --> G0{"闸门 0 · 工具硬边界<br/>bash 黑名单 / 路径围栏<br/>(check_permissions 钩子)"}
-    G0 -->|"命中(bypass 也拦不住)"| DENY["DENY"]
-    G0 -->|"None: 本层不裁决(passthrough)"| G1{"闸门 1 · deny 规则"}
-    G1 -->|"命中(压过一切 allow)"| DENY
-    G1 -->|"未命中"| G2{"闸门 2 · allow 规则"}
-    G2 -->|"命中"| ALLOW["ALLOW"]
-    G2 -->|"未命中"| G3{"闸门 2 · ask 规则"}
-    G3 -->|"命中"| ASK["ASK"]
-    G3 -->|"未命中"| G4{"闸门 3 · 模式默认表<br/>default / plan / acceptEdits / bypass"}
-    G4 -->|"只读 / bypass /<br/>acceptEdits 工作区编辑"| ALLOW
-    G4 -->|"default 写操作 /<br/>acceptEdits 非编辑命令"| ASK
-    G4 -->|"plan 的写与 bash"| DENY
-
-    ASK --> U{"on_ask 用户交互<br/>y / a / n"}
+    B --> P
+    P --> G0
+    G0 --> HOOK
+    HOOK -->|"命中(bypass 也拦不住)"| DENY
+    HOOK -->|"None: 本层不裁决(passthrough)"| G1
+    ASK --> U
     U -->|"y(本次允许)"| ALLOW
-    U -->|"a(总是允许)"| SR["写入会话级规则<br/>(进程结束即失效)"]
+    U -->|"a(总是允许)"| SR
     SR --> ALLOW
     U -->|"n 或无交互通道<br/>(--quiet 安全默认)"| DENY
-
-    ALLOW --> EXEC["validate → 执行 → 截断"]
-    EXEC --> FB1["tool 消息回填(结果文本)"]
-    DENY --> DT["Denial Tracking<br/>同工具连续 3 次 → 注入「改变策略」<br/>总 20 次 → 建议终止<br/>(成功一次即清零)"]
-    DT --> FB2["[权限拒绝] 原因文本回填"]
-    FB1 --> NEXT["模型读到观察结果<br/>下一轮: 继续 / 修正参数 / 换一条路"]
-    FB2 --> NEXT
+    ALLOW --> EXEC
+    DT --> FB2
 ```
 
-图的读法要点：**菱形是闸门（判定），矩形是动作；任何一条 deny 路径都会走到右侧的
-Denial Tracking → 拒绝文本回填**。注意三个「安全默认」：黑名单在 bypass 下仍拦截、
-deny 规则永远压过 allow、无交互通道时 ask 降级为拒绝（宁可错杀，不可错放）。
+图的读法要点：**菱形是闸门（判定），矩形是动作；虚线框 = 源码模块归属**——
+`agent.py` 负责分派与回填（循环骨架），`permissions.py` 拥有三道闸门、四态
+裁决与 Denial Tracking，`tools.py` 提供闸门 0 的硬边界钩子（黑名单/围栏
+定义在工具侧，由权限管线调用），`__main__.py` 只贡献 on_ask 交互回调。
+任何一条 deny 路径都会走到 Denial Tracking → 拒绝文本回填。注意三个
+「安全默认」：黑名单在 bypass 下仍拦截、deny 规则永远压过 allow、
+无交互通道时 ask 降级为拒绝（宁可错杀，不可错放）。
 
 ### 2.3 规则匹配三维度（对应 CC toolMatchesRule）
 

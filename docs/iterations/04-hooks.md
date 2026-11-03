@@ -70,19 +70,25 @@ class HookResult:
 
 ```mermaid
 flowchart TD
-    T["trigger(event, payload)"] --> M["get_matching(event, tool_name)<br/>按注册序过滤（matcher 匹配）"]
-    M --> E{"匹配集为空?"}
-    E -->|是| N["返回空 HookResult<br/>(不干预，四个能力全 None)"]
-    E -->|否| LOOP["按注册序逐个执行 hook"]
-    LOOP --> OK{"hook 正常返回?"}
-    OK -->|是| COLLECT["收集 HookResult"]
-    OK -->|"异常(任何类型)"| WARN["转 system_message 警告『已忽略』<br/>结果等价于空 HookResult"]
-    WARN --> MORE
-    COLLECT --> MORE{"还有下一个 hook?"}
-    MORE -->|是| LOOP
-    MORE -->|否| MERGE["_merge_results 合并"]
-    MERGE --> OUT["返回合并后的 HookResult"]
+    subgraph HOOKS["mini_agent/hooks.py · HookRegistry（本图全部功能）"]
+        T["trigger(event, payload)"] --> M["get_matching(event, tool_name)<br/>按注册序过滤（matcher 匹配）"]
+        M --> E{"匹配集为空?"}
+        E -->|是| N["返回空 HookResult<br/>(不干预，四个能力全 None)"]
+        E -->|否| LOOP["按注册序逐个执行 hook"]
+        LOOP --> OK{"hook 正常返回?"}
+        OK -->|是| COLLECT["收集 HookResult"]
+        OK -->|"异常(任何类型)"| WARN["转 system_message 警告『已忽略』<br/>结果等价于空 HookResult"]
+        WARN --> MORE
+        COLLECT --> MORE{"还有下一个 hook?"}
+        MORE -->|是| LOOP
+        MORE -->|否| MERGE["_merge_results 合并<br/>(模块级函数，同文件)"]
+        MERGE --> OUT["返回合并后的 HookResult"]
+    end
 ```
+
+这张图全部位于 `hooks.py` 一个模块内——注册表（`HookRegistry`）、匹配器
+（`matches_tool`）与合并器（`_merge_results`）自成一个闭环，外部
+（`agent.py`）只拿到最终合并结果。
 
 注意两条「永不崩」路径：匹配集为空返回空结果；单个 hook 异常被隔离成警告、
 不影响其余 hooks 执行——hook 是扩展点，扩展点的故障不能变成宿主的故障。
@@ -94,11 +100,19 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant A as Agent.run()
-    participant R as HookRegistry
+    box rgb(235,239,254) agent.py
+        participant A as Agent.run()
+    end
+    box rgb(234,246,238) hooks.py
+        participant R as HookRegistry
+    end
     participant L as LLM
-    participant P as 权限管线
-    participant T as 工具
+    box rgb(254,246,234) permissions.py
+        participant P as 权限管线
+    end
+    box rgb(240,240,240) tools.py
+        participant T as 工具
+    end
 
     U->>A: prompt
     A->>R: ① UserPromptSubmit

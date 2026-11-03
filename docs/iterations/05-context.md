@@ -59,26 +59,53 @@ registry.register("workspace",  lambda: _workspace_section_text())
 
 ```mermaid
 flowchart TD
-    A["submit_message(text)"] --> B["registry.resolve()"]
-    B --> S{"逐段判定"}
-    S -->|"is_static"| S1{"缓存里有?"}
-    S1 -->|是| H1["命中·返回缓存"]
-    S1 -->|否| C1["计算一次·写入缓存"]
-    S -->|"动态段"| S2{"cache_break?"}
-    S2 -->|"False(默认)"| C2["重算 builder"] --> CMP{"内容 == 缓存?"}
-    CMP -->|是| H2["命中(输入未变)"]
-    CMP -->|否| U["更新缓存"]
-    S2 -->|"True(如 MCP 指令)"| C3["强制重算·永不命中<br/>(DANGEROUS，须有理由)"]
-    H1 --> R["段列表(含 BOUNDARY)"]
-    C1 --> R
-    H2 --> R
-    U --> R
-    C3 --> R
-    R --> F["build_system_prompt()<br/>移除 BOUNDARY·拼接"]
-    F --> G{"messages[0] 相同?"}
-    G -->|是| K["保留(前缀稳定→cache 友好)"]
-    G -->|否| K2["替换 system(动态区变了)"]
-    K --> T["agent.run_turn(messages, text)"]
+    subgraph SESSION["session.py · QueryEngine"]
+        A["submit_message(text)"]
+        G{"messages[0] 相同?"}
+        K["保留(前缀稳定→cache 友好)"]
+        K2["替换 system(动态区变了)"]
+        G -->|是| K
+        G -->|否| K2
+    end
+
+    subgraph PROMPT["prompt.py · SectionRegistry"]
+        B["registry.resolve()"]
+        S{"逐段判定"}
+        S1{"缓存里有?"}
+        H1["命中·返回缓存"]
+        C1["计算一次·写入缓存"]
+        S2{"cache_break?"}
+        C2["重算 builder"]
+        CMP{"内容 == 缓存?"}
+        H2["命中(输入未变)"]
+        U["更新缓存"]
+        C3["强制重算·永不命中<br/>(DANGEROUS，须有理由)"]
+        R["段列表(含 BOUNDARY)"]
+        F["build_system_prompt()<br/>移除 BOUNDARY·拼接"]
+        B --> S
+        S -->|"is_static"| S1
+        S1 -->|是| H1
+        S1 -->|否| C1
+        S -->|"动态段"| S2
+        S2 -->|"False(默认)"| C2 --> CMP
+        CMP -->|是| H2
+        CMP -->|否| U
+        S2 -->|"True(如 MCP 指令)"| C3
+        H1 --> R
+        C1 --> R
+        H2 --> R
+        U --> R
+        C3 --> R
+        R --> F
+    end
+
+    subgraph AGENT["agent.py · Agent"]
+        T["run_turn(messages, text)<br/>循环内原地扩展同一 messages 列表"]
+    end
+
+    A --> B
+    F --> G
+    K --> T
     K2 --> T
 ```
 
@@ -114,9 +141,15 @@ user/assistant/tool 全部消息。
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant E as QueryEngine
-    participant R as SectionRegistry
-    participant A as Agent.run_turn
+    box rgb(235,239,254) session.py
+        participant E as QueryEngine
+    end
+    box rgb(234,246,238) prompt.py
+        participant R as SectionRegistry
+    end
+    box rgb(254,246,234) agent.py
+        participant A as Agent.run_turn
+    end
     participant L as LLM
 
     U->>E: "读一下 hello.txt"（第 1 轮）
