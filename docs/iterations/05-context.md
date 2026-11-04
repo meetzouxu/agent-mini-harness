@@ -175,6 +175,59 @@ sequenceDiagram
     L-->>A: "正如刚才读到的：hello mini-agent"
 ```
 
+#### `engine.messages` 的逐条演变（REPL 实录）
+
+`self.messages` 是什么：一个 `list[dict]`，每条是 OpenAI Chat 协议消息
+（`role` / `content`，assistant 可带 `tool_calls`，tool 消息带 `tool_call_id`）。
+`QueryEngine` 是唯一持有者，`run_turn` 原地扩展它 —— 所以上面的时序图里
+每一箭头都对应列表的一次 append。以 REPL 两轮对话为例（模型读 README.md）：
+
+```text
+时刻 A ─ submit_message("读一下 README.md 的第一行")
+  [0] system    ← QueryEngine 首轮组装（identity 静态区 + tools + workspace）
+  [1] user      ← run_turn append 本轮指令
+  → 发给模型（2 条）
+
+时刻 B ─ 模型返回 tool_call（read_file）
+  [2] assistant  content=null, tool_calls=[c1: read_file(README.md)]
+  → 工具执行后回填观察
+  [3] tool       tool_call_id=c1, content="1\t# agent-mini-harness\n2\t…"
+  → 再次发给模型（4 条：[0..3]）
+
+时刻 C ─ 模型给出最终文本
+  [4] assistant  "README 的第一行是 '# agent-mini-harness'"
+  第 1 轮结束：共 5 条
+
+时刻 D ─ submit_message("刚才读到了什么？")
+  system 不变（动态段命中缓存 → messages[0] 原样保留）
+  [5] user      ← 新指令 append
+  → 发给模型（6 条：[0..5] 整包 —— 这就是「携带的上下文」）
+
+时刻 E ─ 模型回答（能看到 [3] 工具结果与 [4] 上轮回答，所以答得出来）
+  [6] assistant  "刚才读到的是：# agent-mini-harness"
+  会话累计：7 条
+```
+
+逐条索引表：
+
+| # | role | 产生时机（模块） | 内容 |
+|---|------|-----------------|------|
+| 0 | system | `session.py` 首轮组装（`prompt.py` 的段拼接） | identity + 工具清单 + 工作区 |
+| 1 | user | `agent.py` run_turn 入口 | "读一下 README.md 的第一行" |
+| 2 | assistant | `agent.py` 循环吸收模型响应 | `content=null` + `tool_calls[c1]` |
+| 3 | tool | `agent.py` 工具执行后回填 | README 前几行（带行号，受 8k 预算截断） |
+| 4 | assistant | 同 2，无 tool_calls → 终止 | 第一轮最终回答 |
+| 5 | user | `agent.py` run_turn 入口 | "刚才读到了什么？" |
+| 6 | assistant | 同 2 | 第二轮回答 |
+
+两个关键观察：
+
+1. **第 2 轮携带的上下文 = 列表全部 6 条整包重发** —— 这是上下文维护的代价面：
+   每轮 input_tokens 随历史线性增长（第 2 轮 > 第 1 轮），也是迭代 6
+   （上下文压缩）要治理的对象
+2. **列表只增不减**：append 是唯一操作（首轮 system 除外，动态段变化时
+   唯一被替换的位置是 `[0]`） —— 删除/压缩发生在迭代 6 之后
+
 ### 2.5 run_turn：Agent 的增量改造
 
 ```python
