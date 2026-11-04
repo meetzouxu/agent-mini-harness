@@ -38,6 +38,7 @@ from .hooks import (
     HookRegistry,
     HookResult,
 )
+from .compaction import CompactionConfig, budget_tool_result
 
 # ---- ANSI 颜色（macOS/Linux 终端） ----
 _DIM = "\033[2m"
@@ -105,6 +106,7 @@ class Agent:
         max_workers: int = 4,
         permission_manager: PermissionManager | None = None,
         hooks: HookRegistry | None = None,
+        compaction_config: CompactionConfig | None = None,
     ) -> None:
         self.client = client
         self.tools: dict[str, Tool] = {t.name: t for t in tools}
@@ -117,6 +119,8 @@ class Agent:
         self.permissions = permission_manager
         # 迭代 4：hook 注册表；未提供时四个触发点均为空操作（兼容旧测试）
         self.hooks = hooks or HookRegistry()
+        # 迭代 6：压缩配置（L1 budget 即时层在工具回填时使用）
+        self.compaction_config = compaction_config or CompactionConfig()
         # 并发执行工具时，终端打印需要互斥，避免多线程输出交错撕裂
         self._print_lock = threading.Lock()
 
@@ -404,6 +408,10 @@ class Agent:
                 result = post.updated_output  # 改写回填给模型的观察文本
             if post.additional_context:
                 result = f"{result}\n[hook 上下文] {post.additional_context}"
+
+        # ---- 迭代 6：L1 budget 即时层 ——大结果落盘，回填占位+路径 ----
+        # （在 PostToolUse 之后：hook 改写后的结果才是最终要回填的文本）
+        result = budget_tool_result(result, name, self.compaction_config)
 
         self._say(
             f"{_CYAN}⟳ {name}{_RESET} {_DIM}{self._brief(tc.function.arguments)}{_RESET}"

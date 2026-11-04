@@ -20,8 +20,10 @@ docs/conversation/multi-turn.mdx 的 onQueryImpl / submitMessage 链路）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .agent import Agent, RunResult
+from .compaction import CompactionConfig, CompactionReport, auto_compact, run_pipeline
 from .prompt import SectionRegistry, build_system_prompt
 
 
@@ -34,19 +36,81 @@ class SessionStats:
     output_tokens: int = 0
     tool_calls: int = 0
     tool_errors: int = 0
+    # 迭代 6：压缩观测
+    compactions: int = 0          # auto 触发次数
+    tokens_saved: int = 0         # 压缩节省的估算 token
 
 
 class QueryEngine:
-    """多轮会话引擎：Agent + Section 注册表 + 唯一的对话历史。"""
+    """多轮会话引擎：Agent + Section 注册表 + 唯一的对话历史 + 压缩管线。"""
 
-    def __init__(self, agent: Agent, registry: SectionRegistry) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        registry: SectionRegistry,
+        compaction_config: CompactionConfig | None = None,
+        summarizer: Callable[[str], str] | None = None,
+    ) -> None:
         self.agent = agent
         self.registry = registry
+        self.compaction_config = compaction_config or CompactionConfig()
+        self._summarizer = summarizer  # None → 用 agent 的 client 现查
         self.messages: list[dict] = []
         self.stats = SessionStats()
         self.history: list[RunResult] = []  # 每轮的 RunResult（观测用）
+        self.last_compaction: CompactionReport | None = None
+        self._auto_attempts = 0  # auto 熔断计数
 
     # ------------------------------------------------------------------
+
+    def _resolve_summarizer(self) -> Callable[[str], str] | None:
+        """摘要器：注入优先；否则用 agent 的 client 现查；异常降级截断。"""
+        if self._summarizer is not None:
+            return self._summarizer
+        client = self.agent.client
+        model = self.agent.model
+
+        def _llm_summarize(text: str) -> str:
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": (
+                            "把对话历史压缩为要点摘要：保留任务目标、关键决策、"
+                            "重要文件路径与数据、未完成事项。用中文，简洁分点。"
+                        )},
+                        {"role": "user", "content": text},
+                    ],
+                )
+                return resp.choices[0].message.content or "（摘要为空）"
+            except Exception:  # 摘要失败 → 降级为截断式，压缩永不崩
+                return "\n".join(text.splitlines()[:50])[:2000]
+
+        return _llm_summarize
+
+    def compact_now(self, custom_instruction: str = "") -> CompactionReport:
+        """手动压缩（对应 CC /compact，可附自定义聚焦指令）。"""
+        pre = len(self.messages)
+        if pre <= 2:
+            return CompactionReport(pre_tokens=0, post_tokens=0)
+        summarize = self._resolve_summarizer()
+        instruction = (
+            f"（用户要求聚焦：{custom_instruction}）" if custom_instruction else ""
+        )
+        if summarize is None:
+            return CompactionReport(pre_tokens=0, post_tokens=0)
+        wrapped = (lambda text: summarize(text + instruction)) if instruction else summarize
+        self.messages, _summary = auto_compact(
+            self.messages, wrapped, self.compaction_config, boundary_type="manual"
+        )
+        self._auto_attempts += 1
+        report = CompactionReport(
+            pre_tokens=pre,
+            post_tokens=len(self.messages),
+            auto_triggered=True,
+        )
+        self.last_compaction = report
+        return report
 
     def submit_message(self, text: str) -> RunResult:
         """提交一条用户消息，跑一轮完整 Agent Loop，返回该轮结果。
@@ -54,6 +118,18 @@ class QueryEngine:
         messages 跨轮保留（上下文维护的核心）：
         第 N 轮请求 = system + 前 N-1 轮全部消息 + 本轮 user 消息。
         """
+        # ---- 迭代 6：压缩管线（调模型之前，每轮执行） ----
+        # budget 已在 agent 回填时即时处理；此处跑 snip → micro → auto
+        self.messages, report = run_pipeline(
+            self.messages, self.compaction_config, self._resolve_summarizer(),
+            auto_attempts=self._auto_attempts,
+        )
+        if report.auto_triggered:
+            self._auto_attempts += 1  # 熔断计数
+        self.stats.compactions += 1 if report.auto_triggered else 0
+        self.stats.tokens_saved += report.tokens_saved
+        self.last_compaction = report
+
         # 每轮组装 system prompt（静态段命中缓存；动态段确定性比较）
         system = build_system_prompt(self.registry.resolve())
         if not self.messages:
@@ -78,11 +154,13 @@ class QueryEngine:
     # ------------------------------------------------------------------
 
     def clear(self) -> None:
-        """清空会话（对应 CC /clear）：丢弃全部历史与 section 缓存。"""
+        """清空会话（对应 CC /clear）：丢弃全部历史、section 缓存与熔断计数。"""
         self.messages = []
         self.registry.reset()
         self.stats = SessionStats()
         self.history = []
+        self.last_compaction = None
+        self._auto_attempts = 0
 
     def message_count(self) -> int:
         return len(self.messages)

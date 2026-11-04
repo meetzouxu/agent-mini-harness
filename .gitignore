@@ -15,6 +15,7 @@ __pycache__/
 # 迭代 8（保存状态）会引入会话持久化目录（JSONL transcript）
 sessions/
 logs/
+.compact-cache/
 .tasks/
 .memory/
 .scheduled_tasks.json

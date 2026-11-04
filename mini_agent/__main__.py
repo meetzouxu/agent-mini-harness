@@ -201,8 +201,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_repl(engine: QueryEngine) -> int:
     """REPL 多轮会话（对应 claude 终端交互模式：上下文跨轮保留）。"""
-    print("mini-agent REPL —— 迭代 5 多轮会话")
-    print("命令：/clear 清空会话 · /stats 会话统计 · exit 退出")
+    print("mini-agent REPL —— 迭代 6 上下文压缩")
+    print("命令：/clear 清空 · /compact [聚焦指令] 压缩 · /stats 统计 · exit 退出")
     while True:
         try:
             text = input("\nmini-agent> ").strip()
@@ -217,13 +217,25 @@ def _run_repl(engine: QueryEngine) -> int:
             engine.clear()
             print("（已清空会话与 section 缓存）")
             continue
+        if text == "/compact" or text.startswith("/compact "):
+            instruction = text[len("/compact"):].strip()
+            if not engine.messages:
+                print("（会话为空，无需压缩）")
+                continue
+            report = engine.compact_now(instruction)
+            print(
+                f"（手动压缩完成：消息 {len(engine.messages)} 条，"
+                f"估算 token {engine.compaction_config.context_window_tokens} 窗口内）"
+            )
+            continue
         if text == "/stats":
             s = engine.stats
             print(
                 f"[session] turns={s.turns} messages={engine.message_count()} "
                 f"tokens(in/out)={s.input_tokens}/{s.output_tokens} "
                 f"tool_calls={s.tool_calls} errors={s.tool_errors} "
-                f"prompt-cache-hit={engine.cache_hit_rate():.0%}"
+                f"prompt-cache-hit={engine.cache_hit_rate():.0%} "
+                f"compactions={s.compactions} tokens_saved~{s.tokens_saved}"
             )
             continue
         result = engine.submit_message(text)

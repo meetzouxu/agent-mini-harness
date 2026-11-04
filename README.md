@@ -7,7 +7,7 @@
 **路线图**：[docs/ROADMAP.md](docs/ROADMAP.md) —— 8 阶段 23 次迭代；
 能力全景：[docs/references/agent-capability-map.md](docs/references/agent-capability-map.md)
 
-**当前进度**：迭代 1 ✅ Agent Loop（[拆解](docs/iterations/01-agent-loop.md)）｜迭代 2 ✅ 工具编排（[拆解](docs/iterations/02-tool-use.md)）｜迭代 3 ✅ 权限管线（[拆解](docs/iterations/03-permissions.md)）｜迭代 4 ✅ Hooks（[拆解](docs/iterations/04-hooks.md)）｜迭代 5 ✅ 维护上下文（[拆解](docs/iterations/05-context.md)）
+**当前进度**：迭代 1 ✅ Agent Loop（[拆解](docs/iterations/01-agent-loop.md)）｜迭代 2 ✅ 工具编排（[拆解](docs/iterations/02-tool-use.md)）｜迭代 3 ✅ 权限管线（[拆解](docs/iterations/03-permissions.md)）｜迭代 4 ✅ Hooks（[拆解](docs/iterations/04-hooks.md)）｜迭代 5 ✅ 维护上下文（[拆解](docs/iterations/05-context.md)）｜迭代 6 ✅ 上下文压缩（[拆解](docs/iterations/06-compaction.md)）
 
 ## 快速开始
 
