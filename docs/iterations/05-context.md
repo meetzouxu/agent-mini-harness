@@ -228,6 +228,91 @@ sequenceDiagram
 2. **列表只增不减**：append 是唯一操作（首轮 system 除外，动态段变化时
    唯一被替换的位置是 `[0]`） —— 删除/压缩发生在迭代 6 之后
 
+#### 请求体明细：每个时刻发给模型的完整 JSON
+
+（system 的 content 是**单个字符串**，`\n` 转义分隔各段——
+下面是 `prompt.py` 三个 section 拼装后的真实全文）
+
+**时刻 A** —— 第一轮提交后的第一次请求（2 条）：
+
+```json
+[
+  {
+    "role": "system",
+    "content": "你是 mini-agent，一个运行在终端里的编码助手，通过工具读写文件、搜索代码、执行命令来完成任务。\n\n规则：\n1. 调用工具前先想清楚参数；能用一次工具完成的不要拆成多次。\n2. 工具返回错误时，仔细阅读错误信息、修正参数后重试，不要放弃。\n   特别是 edit_file：old_string 必须唯一，报错不唯一时扩大上下文重试。\n3. 被权限拒绝的操作不要原样重试 —— 阅读拒绝理由，改变策略或换一条路。\n4. 任务完成后，用简洁的中文总结你做了什么、改了哪些文件。\n5. 所有文件路径都相对当前工作目录。\n\n可用工具（调用前先确认参数）:\n- bash: 在 shell 中执行命令并返回输出、退出码与耗时\n- edit_file: 精确文本替换：old_string 必须在文件中唯一出现（否则报错），用 new_string 替换\n- glob_files: 按通配符模式搜索文件\n- grep: 按正则搜索文件内容\n- list_dir: 列出目录下的文件与子目录\n- read_file: 读取文本文件内容\n- write_file: 将文本内容写入文件（覆盖写入）\n\n工作目录: /Users/nian/CatPaw/agent-mini-harness\n平台: Darwin arm64\ngit 分支: main"
+  },
+  {
+    "role": "user",
+    "content": "读一下 README.md 的第一行"
+  }
+]
+```
+
+**时刻 B** —— 模型返回 tool_call、工具执行后的第二次请求（4 条）。
+`[0][1]` 与时刻 A **逐字节一致**（前缀稳定 → prompt cache 命中条件），
+新增的两条如下：
+
+```json
+[
+  { "role": "system", "content": "（与时刻 A 逐字节一致，略）" },
+  { "role": "user", "content": "读一下 README.md 的第一行" },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_0_a1b2c3",
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "arguments": "{\"path\": \"README.md\", \"limit\": 5}"
+        }
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "tool_call_id": "call_0_a1b2c3",
+    "name": "read_file",
+    "content": "1\t# agent-mini-harness\n2\t\n3\t渐进式复刻 Agent 能力：用 Python 从零复刻 Claude Code，从 Agent Loop 开始，\n4\t一步步迭代到拥有维护上下文、编排工具、保存状态、控制并发、异步执行、\n5\t失败重试、权限校验、日志监控等能力的完备 Agent。"
+  }
+]
+```
+
+两个协议细节（都是踩过坑的）：
+- `arguments` 是**嵌在 JSON 字符串里的 JSON**（双重转义）——所以代码必须
+  `json.loads`，也是「参数解析失败」错误路径的来源（迭代 1 已实测）
+- tool 消息的 `tool_call_id` 必须与 assistant 里 `tool_calls[0].id` **配对**，
+  漏配 API 直接 400；这份不变量在迭代 6 压缩时还会回来（不能拆散配对）
+
+**时刻 D** —— 第二轮提交后的请求（6 条整包，即「携带的上下文」的全部明细）：
+
+```json
+[
+  { "role": "system", "content": "（与时刻 A 逐字节一致 —— 动态段命中缓存，略）" },
+  { "role": "user", "content": "读一下 README.md 的第一行" },
+  {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+      {
+        "id": "call_0_a1b2c3",
+        "type": "function",
+        "function": { "name": "read_file", "arguments": "{\"path\": \"README.md\", \"limit\": 5}" }
+      }
+    ]
+  },
+  { "role": "tool", "tool_call_id": "call_0_a1b2c3", "name": "read_file",
+    "content": "1\t# agent-mini-harness\n2\t\n3\t渐进式复刻 Agent 能力：…（同时刻 B，略）" },
+  { "role": "assistant", "content": "README 的第一行是 \"# agent-mini-harness\"。" },
+  { "role": "user", "content": "刚才读到了什么？" }
+]
+```
+
+第 2 轮的 `input_tokens` 按**这 6 条整体计费**；模型正是靠 `[3]`（工具
+观察）和 `[4]`（上轮回答）回答出「刚才读到了什么」——把任意一条删掉，
+模型就答不出或开始幻觉。这就是「上下文」在协议层面的全部含义。
+
 ### 2.5 run_turn：Agent 的增量改造
 
 ```python
