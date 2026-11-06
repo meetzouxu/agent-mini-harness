@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .memory import DRIFT_GUARD_TEXT
+
 # 分界标记（不发送给 API，仅用于分割缓存区）
 SYSTEM_PROMPT_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
@@ -175,14 +177,25 @@ def _workspace_section_text() -> str:
     )
 
 
-def default_registry(tools) -> SectionRegistry:
-    """默认注册表：静态区（identity）+ 动态区（tools / workspace）。
+def default_registry(tools, user_memory=None) -> SectionRegistry:
+    """默认注册表：静态区（identity）+ 动态区（tools / workspace / memory）。
 
     工具列表以引用捕获——运行中注册新工具后，下一轮 resolve 自动反映变化
     （内容变化 → 缓存失效 → system prompt 更新）。
+    user_memory 提供时注册 memory 段（迭代 7）：索引常驻 system prompt；
+    新记忆保存 → 索引变化 → 同样走缓存失效自动更新。
     """
     registry = SectionRegistry()
     registry.register("identity", lambda: IDENTITY_TEXT, is_static=True)
     registry.register("tools", lambda: _tools_section_text(tools))
     registry.register("workspace", lambda: _workspace_section_text())
+    if user_memory is not None:
+        registry.register("memory", lambda: _memory_section_text(user_memory))
     return registry
+
+
+def _memory_section_text(user_memory) -> str:
+    """memory 段：索引常驻（对应 CC systemPromptSection('memory')）+ 漂移防御。"""
+    index = user_memory.load_index()
+    body = index.strip() or "（空——用户尚未沉淀任何跨会话记忆）"
+    return f"已知记忆（跨会话，{DRIFT_GUARD_TEXT}）：\n{body}"

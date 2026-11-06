@@ -30,6 +30,7 @@ from .permissions import (
 )
 from .prompt import default_registry
 from .session import QueryEngine
+from .memory import UserMemory
 from .tools import default_tools
 
 DEFAULT_SYSTEM_PROMPT = """\
@@ -163,6 +164,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         mode = args.permission_mode
         on_ask = _terminal_ask
+    # 迭代 7：跨会话记忆（.memory/ 纯文件存储，gitignored）
+    memory = UserMemory(Path(".memory"))
+
     permissions = PermissionManager(mode=mode, rules=rules, on_ask=on_ask)
     hooks = _builtin_hooks()
     tools = default_tools()
@@ -179,8 +183,8 @@ def main(argv: list[str] | None = None) -> int:
         permission_manager=permissions,
         hooks=hooks,
     )
-    registry = default_registry(tools)  # 捕获 tools 引用：工具变化 → 下轮自动反映
-    engine = QueryEngine(agent, registry)
+    registry = default_registry(tools, user_memory=memory)  # 捕获 tools/memory 引用：变化 → 下轮自动反映
+    engine = QueryEngine(agent, registry, memory=memory)
 
     if args.prompt is None:
         return _run_repl(engine)
@@ -201,8 +205,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_repl(engine: QueryEngine) -> int:
     """REPL 多轮会话（对应 claude 终端交互模式：上下文跨轮保留）。"""
-    print("mini-agent REPL —— 迭代 6 上下文压缩")
-    print("命令：/clear 清空 · /compact [聚焦指令] 压缩 · /stats 统计 · exit 退出")
+    print("mini-agent REPL —— 迭代 7 记忆系统")
+    print("命令：/clear 清空 · /compact 压缩 · /memory 记忆 · /stats 统计 · exit 退出")
     while True:
         try:
             text = input("\nmini-agent> ").strip()
@@ -227,6 +231,13 @@ def _run_repl(engine: QueryEngine) -> int:
                 f"（手动压缩完成：消息 {len(engine.messages)} 条，"
                 f"估算 token {engine.compaction_config.context_window_tokens} 窗口内）"
             )
+            continue
+        if text == "/memory":
+            entries = engine.memory.list_all() if engine.memory else []
+            if not entries:
+                print("（记忆为空——对话中说出「记住 …」或表达偏好即可沉淀）")
+            for e in entries:
+                print(f"  [{e.category}] {e.content}")
             continue
         if text == "/stats":
             s = engine.stats

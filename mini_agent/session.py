@@ -24,6 +24,7 @@ from typing import Callable
 
 from .agent import Agent, RunResult
 from .compaction import CompactionConfig, CompactionReport, auto_compact, run_pipeline
+from .memory import UserMemory, extract_memories
 from .prompt import SectionRegistry, build_system_prompt
 
 
@@ -39,6 +40,8 @@ class SessionStats:
     # 迭代 6：压缩观测
     compactions: int = 0          # auto 触发次数
     tokens_saved: int = 0         # 压缩节省的估算 token
+    # 迭代 7：记忆观测
+    memories_saved: int = 0       # 本会话新保存的记忆条数
 
 
 class QueryEngine:
@@ -50,11 +53,14 @@ class QueryEngine:
         registry: SectionRegistry,
         compaction_config: CompactionConfig | None = None,
         summarizer: Callable[[str], str] | None = None,
+        memory: UserMemory | None = None,
     ) -> None:
         self.agent = agent
         self.registry = registry
         self.compaction_config = compaction_config or CompactionConfig()
         self._summarizer = summarizer  # None → 用 agent 的 client 现查
+        self.memory = memory  # 迭代 7：跨会话记忆（None → 功能关闭）
+        self._surfaced: set[str] = set()  # 已展示去重（对应 CC alreadySurfaced）
         self.messages: list[dict] = []
         self.stats = SessionStats()
         self.history: list[RunResult] = []  # 每轮的 RunResult（观测用）
@@ -136,11 +142,28 @@ class QueryEngine:
             if system:
                 self.messages.append({"role": "system", "content": system})
         elif self.messages[0].get("content") != system:
-            # 动态区变化（工具增删 / cwd 切换）→ 替换 system，
+            # 动态区变化（工具增删 / cwd 切换 / 新记忆）→ 替换 system，
             # 静态前缀不变的部分在真实 API 上仍可命中 prompt cache
             self.messages[0] = {"role": "system", "content": system}
 
+        # ---- 迭代 7：side-query 按需注入（≤5 条，已展示去重） ----
+        # 命中时注入到本轮 user 消息之前——历史前缀不变，不破坏 cache
+        if self.memory is not None:
+            hits = self.memory.side_query(text, exclude_contents=self._surfaced)
+            if hits:
+                lines = "\n".join(f"- [{h.category}] {h.content}" for h in hits)
+                self.messages.append(
+                    {"role": "user", "content": f"[相关记忆]（按需注入，引用前验证时效）\n{lines}"}
+                )
+                self._surfaced.update(h.content for h in hits)
+
         result = self.agent.run_turn(self.messages, text)
+
+        # ---- 迭代 7：轮后提取（显式「记住」/ 偏好句式 → 跨会话保存） ----
+        if self.memory is not None:
+            for entry in extract_memories(text, result.final_text):
+                if self.memory.save(entry):
+                    self.stats.memories_saved += 1  # 下轮 memory 段缓存失效自动反映
 
         # 跨轮累计（对应 CC 会话级 cost 累计）
         self.stats.turns += 1
@@ -154,13 +177,15 @@ class QueryEngine:
     # ------------------------------------------------------------------
 
     def clear(self) -> None:
-        """清空会话（对应 CC /clear）：丢弃全部历史、section 缓存与熔断计数。"""
+        """清空会话（对应 CC /clear）：丢弃全部历史、section 缓存与熔断计数。
+        跨会话记忆不受影响（记忆的生命周期 = 磁盘文件，非会话）。"""
         self.messages = []
         self.registry.reset()
         self.stats = SessionStats()
         self.history = []
         self.last_compaction = None
         self._auto_attempts = 0
+        self._surfaced = set()
 
     def message_count(self) -> int:
         return len(self.messages)

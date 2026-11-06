@@ -42,7 +42,7 @@
 |---|------|---------|----------------------|
 | 5 | **维护上下文：多轮会话 + System Prompt 组装** ✅ | QueryEngine 多轮会话（submitMessage 模式，messages 跨轮复用）；PROMPT_SECTIONS 分段（identity 静态 + tools/workspace 动态，BOUNDARY 分界）；确定性缓存（内容比对命中，cache_break 强制重算）；REPL 模式（/clear /stats） | `QueryEngine`、`getSystemContext/getUserContext` |
 | 6 | **上下文压缩 Compact** ✅ | 四层管线：budget（大结果落盘 .compact-cache/，agent 回填时即时执行）→ snip（>50 条保留头 3 尾 47，刀口避开工具对）→ micro（>50% 窗口旧 tool 内容占位，保留最近 6 个）→ auto（>75% LLM 摘要 + CompactBoundary）；熔断 3 次 + reactive 本地兜底；preserve_api_invariants 配对保护 | `compaction.mdx`、`adjustIndexToPreserveAPIInvariants` |
-| 7 | **记忆系统 Memory** | User/Session Memory 两层；`.memory/` 目录 + MEMORY.md 索引（常驻 system prompt）；四类记忆（user/feedback/project/reference）；side-query 按需注入（≤5 条）；每轮结束提取器 + 阈值触发整理去重 | memory 子系统（两层记忆 + 索引常驻） |
+| 7 | **记忆系统 Memory** ✅ | User/Session 两层（Session=迭代 6 摘要正名）；`.memory/` 四类文件 + MEMORY.md 索引（双上限 200 行/25KB）常驻 system prompt；side-query 2-gram 召回 ≤5 条按需注入 + 已展示去重；轮后规则提取（显式/偏好/纠正句式）；类内超限 consolidate 去重裁旧；漂移防御文案 | memory 子系统（两层记忆 + 索引常驻） |
 
 ### 阶段三：状态与规划
 
@@ -107,4 +107,5 @@
 - 迭代 4 ✅ Hooks 扩展点：四事件 + 四能力 + 合并语义 + hook/权限融合 + 防循环护栏，22 新单测（全套 84 个通过）。详见 [iterations/04-hooks.md](iterations/04-hooks.md)
 - 迭代 5 ✅ 维护上下文：QueryEngine 多轮会话 + SectionRegistry 分段组装 + 确定性缓存 + REPL，18 新单测（全套 102 个通过）。详见 [iterations/05-context.md](iterations/05-context.md)
 - 迭代 6 ✅ 上下文压缩：四层管线（budget/snip/micro/auto）+ 配对不变量保护 + 熔断与 reactive 兜底 + /compact 命令，22 新单测（全套 124 个通过）。详见 [iterations/06-compaction.md](iterations/06-compaction.md)
-- 下一步：迭代 7 记忆系统（User/Session Memory + MEMORY.md 索引常驻）
+- 迭代 7 ✅ 记忆系统：纯文件跨会话记忆（四类 + 索引 + 2-gram 召回 + 轮后提取 + consolidate），23 新单测（全套 147 个通过）。详见 [iterations/07-memory.md](iterations/07-memory.md)
+- 下一步：迭代 8 保存状态（JSONL transcript + --resume 会话恢复）
