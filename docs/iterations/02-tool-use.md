@@ -65,6 +65,120 @@ class Tool:
 | `validateInput()` | `validate_arguments()` | 执行前校验，在权限检查之前 |
 | `buildTool()` | `Tool(...)` 构造 | 类型安全的工厂（CC 用 TS satisfies，Python 用 dataclass） |
 
+#### 与模型的协商协议：tools 参数（实际 JSON）
+
+工具调用依赖 API 请求里的**两个并列参数**：`messages` 是对话历史（迭代 5
+的 `self.messages`），`tools` 是**每轮随请求一起发送的「工具目录」**——
+模型看目录决定点什么「菜」，点什么写进响应的 `tool_calls`。
+`Tool.to_api_schema()` 的产出就是 tools 数组的元素（`_call_model` 里
+`tools=[t.to_api_schema() for t in self.tools.values()]`）。
+
+任务「统计 mini_agent 下有几个 .py 文件」的第一次请求（7 个工具全发，
+此处展示 2 个，其余同构）：
+
+```json
+{
+  "model": "deepseek-chat",
+  "messages": [
+    { "role": "system", "content": "你是 mini-agent，一个运行在终端里的编码助手…" },
+    { "role": "user", "content": "统计 mini_agent 下有几个 .py 文件" }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "glob_files",
+        "description": "按通配符模式搜索文件，例如 '**/*.py' 或 'docs/*.md'。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": { "type": "string", "description": "glob 通配符模式" }
+          },
+          "required": ["pattern"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "在 shell 中执行命令并返回输出、退出码与耗时。适合运行测试、git 操作、统计命令等。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": { "type": "string", "description": "要执行的 shell 命令" },
+            "timeout": { "type": "integer", "description": "超时秒数，默认 30，上限 120" }
+          },
+          "required": ["command"]
+        }
+      }
+    }
+  ]
+}
+```
+
+模型的响应——目录里选了 `glob_files`，参数作为 **JSON 字符串**放进
+`tool_calls`（与迭代 1/5 讲的双重转义呼应）：
+
+```json
+{
+  "id": "chatcmpl-xxxx",
+  "model": "deepseek-chat",
+  "choices": [{
+    "index": 0,
+    "finish_reason": "tool_calls",
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_0_a1b2c3",
+          "type": "function",
+          "function": {
+            "name": "glob_files",
+            "arguments": "{\"pattern\": \"mini_agent/*.py\"}"
+          }
+        }
+      ]
+    }
+  }],
+  "usage": { "prompt_tokens": 1050, "completion_tokens": 38, "total_tokens": 1088 }
+}
+```
+
+第二次请求：`messages` 增长到 4 条（assistant + tool 观察回填，见迭代 5
+的逐条演变），**tools 原样再发一遍**（每轮都带——模型需要知道当前可用
+工具；运行中注册新工具，下一轮目录自动更新）：
+
+```json
+{
+  "model": "deepseek-chat",
+  "messages": [
+    { "role": "system", "content": "你是 mini-agent…" },
+    { "role": "user", "content": "统计 mini_agent 下有几个 .py 文件" },
+    { "role": "assistant", "content": null,
+      "tool_calls": [
+        { "id": "call_0_a1b2c3", "type": "function",
+          "function": { "name": "glob_files", "arguments": "{\"pattern\": \"mini_agent/*.py\"}" } }
+      ]
+    },
+    { "role": "tool", "tool_call_id": "call_0_a1b2c3", "name": "glob_files",
+      "content": "mini_agent/__init__.py\nmini_agent/__main__.py\n…共 8 项（最多展示 200）" }
+  ],
+  "tools": [ "（与第一次请求完全相同的 7 个工具目录）" ]
+}
+```
+
+三个协议要点：
+
+1. **`parameters` 的 JSON Schema 服务两端**：发给模型是「菜单描述」
+   （模型据此生成合法参数），本地 `validate_arguments` 用同一份 schema
+   做回填前校验——一份契约，两处使用
+2. **name 是协商的唯一键**：模型响应里的 `tool_calls.function.name`
+   必须能在 tools 目录里查到（查不到 → 迭代 1 的「未知工具」错误路径）
+3. **模型只产出参数，不执行**：`glob_files` 是否真的执行、能不能执行
+   （权限闸门）、并发还是串行——全部由 agent 侧决定，模型只是「点菜」
+
 ### 2.2 参数校验：第一道防线（在权限之前）
 
 CC 的调用链路是 `validateInput → canUseTool → checkPermissions → call()`。
