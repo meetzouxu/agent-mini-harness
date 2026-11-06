@@ -152,6 +152,173 @@ PermissionRule(tool="write_file", behavior=ALLOW, content="src/**")  # 路径 gl
 `github-cli` 也会误命中——**前缀必须保留 `git ` 带空格**。单测
 `test_bash_command_prefix_match` 专门锁住这个行为。
 
+#### 2.3.1 PermissionRule 与 PermissionResult：判断依据与判断结论
+
+**PermissionRule 是可反复使用的规则；PermissionResult 是针对本次工具调用产生的裁决。**
+两者没有继承关系，规则也不会自动变成结果；由 `PermissionManager.check()` 在命中规则后构造结果。
+
+| 对象 | 核心字段 | 职责 | 保存位置 |
+|------|----------|------|----------|
+| `PermissionRule` | `tool / behavior / content / source` | 声明哪些调用允许、拒绝或需要确认 | `PermissionManager.self.rules` 内存列表 |
+| `PermissionResult` | `behavior / reason` | 告诉调用方本次操作该如何处理，以及原因 | 本次检查或裁决的返回值 |
+
+规则来源与生命周期：
+
+- 程序启动时，`load_settings_rules(Path.cwd())` 读取 `.mini-agent/settings.json`，通过 `parse_rule_entry()` 转成规则对象，传入 `PermissionManager`。
+- 构造器用 `self.rules = list(rules or [])` 保存规则列表；没有配置文件时可以是空列表。
+- 用户选择 `a`（总是允许）时，向该列表追加 `source="session"` 的 allow 规则，不写回配置文件；退出进程后失效。
+- `source` 是来源标签，用于显示裁决理由，不直接决定匹配优先级。
+- 用户给模型的自然语言任务不是授权规则；当前只有显式配置或确认交互等代码路径会添加规则。
+
+**如果 settings.json 不存在，或者里面没有当前工具的规则，PermissionRule 从哪里来？**
+
+答案是：**不一定会有 PermissionRule，也不需要先生成规则才能裁决。** `PermissionRule` 类只是规则对象的模板，
+定义这个类、注册 Tool，都不会自动给每个工具创建一条规则。标准 CLI 在配置文件不存在时得到空列表；
+文件存在但缺少当前工具的规则时，也不会自动补齐该工具的规则（其他通配规则仍可能匹配它）。
+
+在没有匹配规则、且工具硬边界没有直接裁决的情况下，`check()` 调用 `_default_behavior(tool)`，
+根据权限模式和 `tool.is_read_only` 等信息，**直接创建 PermissionResult，不创建 PermissionRule**。
+工具硬边界同样可以直接返回 PermissionResult，完全不经过规则对象。
+
+以没有 settings.json、default 模式调用 write_file 为例：
+
+1. 启动：`load_settings_rules()` 返回 `[]`，管理器的 `self.rules=[]`。
+2. 调用：写入路径通过工具硬边界检查，三次 `_match_rule()` 都找不到规则。
+3. 默认裁决：`_default_behavior()` 返回 ASK 类型的 PermissionResult，此时规则列表仍为空。
+4. 用户选 `y`：返回本次 ALLOW 的 PermissionResult，规则列表仍为空；下次写文件通常还要问。
+5. 用户选 `a`：`decide()` 才执行 `PermissionRule(tool="write_file", behavior=Behavior.ALLOW, source="session")`，
+   将新对象追加到 `self.rules`，并返回本次 ALLOW 的 PermissionResult。
+6. 后续调用：`_match_rule(ALLOW, ...)` 可以找到这条会话规则，`check()` 据此生成新的 ALLOW 结果。
+
+因此有两条不同路径：**没有规则 → 默认生成 Result；选择“总是允许” → 新建 Rule → 后续调用匹配 Rule 并生成 Result。**
+如果由其他 Python 代码使用管理器，也可以显式构造 PermissionRule 并通过 `PermissionManager(rules=...)` 传入；
+这是调用方创建规则，不是管理器自动生成内置规则。CLI 的 `--permission-mode` / `--yes` 在当前实现中设置的是模式，
+也不会自动创建 PermissionRule。
+
+#### 2.3.2 核心调用链：谁查规则，谁比较，谁生成结果？
+
+入口是 `check(tool, arguments)`：`tool` 是本地工具对象，`arguments` 是模型给出的工具参数。
+**`_match_rule` 属于 PermissionManager，不属于 Tool。** Tool 提供工具名与硬边界钩子，管理器负责查询规则。
+
+```text
+本次调用：tool.name="bash"，arguments={"command": "git status"}
+    ↓
+PermissionManager.check(tool, arguments)
+    ├─ 先调用 tool.check_permissions(arguments)：硬边界有裁决就返回
+    ├─ _match_rule(DENY, tool.name, arguments)
+    ├─ _match_rule(ALLOW, tool.name, arguments)
+    ├─ _match_rule(ASK, tool.name, arguments)
+    └─ 都没有命中 → _default_behavior(tool)
+
+每次 _match_rule 的内部：
+    遍历 self.rules
+    → 先筛选 rule.behavior 是否等于本次要查的行为
+    → 再调用 _rule_matches(rule, tool_name, arguments)
+    → 返回第一个匹配的 PermissionRule；找不到返回 None
+
+check 拿到命中的规则 hit：
+    → 构造 PermissionResult(对应行为, 包含 hit.source 和 hit.describe() 的原因)
+```
+
+这里有三个不同的返回类型，不能混淆：
+
+| 函数 | 返回类型 | 回答的问题 |
+|------|----------|------------|
+| `_rule_matches()` | `bool` | 这一条规则适用于当前调用吗？ |
+| `_match_rule()` | `PermissionRule \| None` | 这一类行为中，第一条适用的规则是哪条？ |
+| `check()` | `PermissionResult` | 综合硬边界、规则和默认模式，本次裁决是什么？ |
+
+`_match_rule()` 的等价展开如下（省略类型标注，便于阅读）：
+
+```python
+for rule in self.rules:
+    if rule.behavior is not behavior:
+        continue
+    if _rule_matches(rule, tool_name, arguments):
+        return rule
+return None
+```
+
+**不是按列表顺序直接取第一条任意行为的规则。** `check()` 会先查完所有 deny 候选，再查 allow，最后查 ask。
+因此规则行为优先级是 `DENY > ALLOW > ASK`；同一行为内部才按列表顺序取第一个匹配者。
+这与多个 Hook 合并时的 `deny > ask > allow` 是不同的逻辑。
+
+#### 2.3.3 _rule_matches：工具名与参数怎样对上规则？
+
+单条规则按以下顺序匹配，完全由 Python 执行，不需要 LLM 判断：
+
+1. **工具名**：`fnmatch.fnmatchcase(tool_name, rule.tool)`，支持大小写敏感的 glob；`tool="*"` 匹配全部工具。
+2. **整工具规则**：工具名匹配且 `content is None`，直接返回 True，不检查具体命令或路径。
+3. **bash 命令规则**：读取 `arguments["command"]`。`content` 以 `*` 结尾时，去掉最后一个星号后做 `startswith()`；否则做字符串全等比较。
+4. **非 bash 的路径规则**：读取 `arguments["path"]`，路径缺失或为空则不匹配，否则使用 `fnmatch.fnmatch(path, content)`。
+
+| 规则 | 当前调用 | 匹配结果 |
+|------|----------|----------|
+| `tool="bash", content=None` | bash 执行任意命令 | True，整工具授权 |
+| `tool="bash", content="git status"` | `command="git status"` | True，精确匹配 |
+| 同上 | `command="git diff"` | False，命令不同 |
+| `tool="bash", content="git *"` | `command="git diff"` | True，前缀为 `git ` |
+| 同上 | `command="github-cli"` | False，不以 `git ` 开头 |
+| `tool="write_file", content="src/**"` | `path="src/main.py"` | True，路径模式匹配 |
+| 同上 | `path="docs/note.md"` | False，路径不匹配 |
+
+**bash 的 content 不是完整 glob，也不是 shell 安全分析器。** 当前实现只做末尾星号的前缀匹配或精确比较。
+例如 `git *` 也可能匹配 `git status && 其他命令`，不能据此保证整个命令链只读。
+文件路径使用的是 `fnmatch`，其 `*` 可以跨 `/`，不要直接套用其他 glob 库中 `*` 与 `**` 的目录层级规则。
+
+#### 2.3.4 例子：PermissionRule 如何变成 PermissionResult？
+
+**例 A：命中已有 allow 规则。** 内存中存在：
+
+```python
+PermissionRule(
+    tool="bash",
+    behavior=Behavior.ALLOW,
+    content="git status",
+    source="settings",
+)
+```
+
+模型请求 `bash`，参数为 `{"command": "git status"}`：
+
+1. 工具硬边界未拒绝。
+2. `_match_rule(DENY, ...)` 找不到匹配规则，返回 None。
+3. `_match_rule(ALLOW, ...)` 找到上面的规则，返回该规则对象。
+4. `check()` 构造 `PermissionResult(Behavior.ALLOW, "命中 allow 规则[settings]: bash:git status")`。
+5. 普通 `decide()` 路径直接返回允许结果，不调用 `on_ask`。
+
+**例 B：allow 与 deny 同时匹配。** 即使存在 `tool="bash", content=None` 的整工具 allow，
+只要另有一条匹配当前调用的 deny，`check()` 就会在查 deny 阶段返回 DENY，不再查 allow。
+用户选择“总是允许”追加的规则也不能推翻 deny 或工具硬边界。
+
+**例 C：没有规则命中。** `self.rules=[]`，模型请求 `bash` 执行 `wc -l mini_agent/agent.py`：
+
+1. 三次 `_match_rule()` 都返回 None。
+2. `_default_behavior()` 在 default 模式下看到 `bash.is_read_only=False`，返回 ASK。
+3. 这里没有将 `wc` 分析为写命令，而是 bash 工具整体不能保证只读；源码理由中的“写操作需确认”是较粗的表述。
+4. `decide()` 调用 `on_ask(tool.name, arguments, result.reason)` 等待用户选择。
+
+| 用户选择 | 当前返回的 PermissionResult | 对规则列表的影响 |
+|----------|-----------------------------|------------------|
+| `y` | ALLOW，用户本次允许 | 不添加规则 |
+| `a` | ALLOW，已写入会话级规则 | 追加当前工具的 allow 规则 |
+| `n` | DENY，用户拒绝 | 不添加规则，更新拒绝计数 |
+| 无交互回调 | DENY，默认拒绝 | 不添加规则，更新拒绝计数 |
+
+选 `a` 后，新增的是 `PermissionRule(tool="bash", behavior=Behavior.ALLOW, source="session")`，
+**没有 content 限制，所以授权整个 bash 工具，而不只是当前 wc 命令。** 下一次 bash 调用命中该规则后，
+通常无需再询问；硬边界、deny 规则以及迭代 4 的 Hook 拦截仍然有效。
+
+#### 2.3.5 check 与 decide 的边界
+
+- `check()`：只得出 ALLOW / ASK / DENY，不询问用户，也不修改规则列表或拒绝计数。
+- `peek()`：直接调用 `check()`，用于执行前预检。
+- `decide()`：处理 `check()` 的结果；ASK 时调用回调，将用户答案变为最终 ALLOW / DENY，必要时追加会话规则。
+- 模式默认表只在所有配置规则都未命中时使用，不是独立于规则的最高优先级安全边界。
+- 迭代 4 起 Agent 还会通过 `_permission_with_hook()` 融合 PreToolUse 的意见；本节讲的是权限管理器内部的规则匹配链，不代替 Hook 融合规则。
+
+总结：**Rule 是依据，_rule_matches 是单条比较，_match_rule 是按行为查找，check 是生成裁决，decide 是交互并落实裁决。**
+
 ### 2.4 权限模式表（对应 CC PermissionMode）
 
 | 模式 | 只读 | 写文件 | bash |
