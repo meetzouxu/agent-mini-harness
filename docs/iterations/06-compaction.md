@@ -101,6 +101,71 @@ auto 压缩后的消息结构：
 `get_messages_after_boundary()` 只取最后一个 boundary 之后的消息
 （会话恢复场景避免重复压缩，迭代 8 会用到）。
 
+#### 实战演示：一次 auto 压缩的完整数据变化
+
+以一个 REPL 会话为例（`keep_tail=6`，窗口 10000 token，估算水位 ~8200 已超
+75% 阈值）。**压缩前的 messages（13 条）**：
+
+```text
+[0]  system     "你是 mini-agent…（identity + 工具清单 + 工作区）"
+[1]  user       "读一下 docs/ROADMAP.md 并总结迭代规划"
+[2]  assistant  content=null, tool_calls=[c1: read_file(docs/ROADMAP.md)]
+[3]  tool       c1 → "[工具结果过大（9000 字符），已完整保存至
+                  .compact-cache/read_file-a1b2.txt…]"   ← L1 落盘后的占位
+[4]  assistant  "路线图共 8 阶段 23 次迭代，阶段一是基础能力（loop/工具/权限/hooks）…"
+[5]  user       "现在统计 mini_agent 下有多少个 .py 文件"
+[6]  assistant  content=null, tool_calls=[c2: bash("ls mini_agent/*.py | wc -l")]
+[7]  tool       c2 → "exit_code=0 (85 ms)\n7"
+[8]  assistant  "共 7 个 .py 文件。"
+[9]  user       "把总结写入 summary.md"
+[10] assistant  content=null, tool_calls=[c3: write_file(summary.md)]
+[11] tool       c3 → "已写入 summary.md（120 字符，3 行）"
+[12] assistant  "已写入 summary.md，包含迭代规划与文件统计。"
+```
+
+**auto_compact 执行过程**：
+
+1. 计算 `keep_tail=6` → 保留尾部 `[7..12]`，被摘要区间 = `[1..6]`
+2. `_render_for_summary` 把 `[1..6]` 渲染成文本交给 LLM，摘要返回：
+   「①用户在分析 mini-agent 项目；②读 ROADMAP 得知 8 阶段 23 迭代；
+   ③bash 统计 mini_agent/ 共 7 个 .py 文件」
+3. 拼装新列表后跑 `preserve_api_invariants`——**注意 [7] 发生了什么**：
+   c2 的 assistant（`[6]`）进了摘要区，c2 的 tool 消息（`[7]`）留在保留区，
+   刀口恰好把这对拆散 → `[7]` 成了孤儿 → **被不变量保护删除**。
+   信息没有丢：c2 的结果「7 个文件」已进摘要第 ③ 条。
+
+**压缩后的 messages（6 条）**：
+
+```text
+[0] system     （原样，与压缩前逐字节一致）
+[1] user       "[compact_boundary type=auto pre_tokens=8200 compacted_messages=6]
+                以下是对话摘要，请基于它继续工作：
+                ① 用户在分析 mini-agent 项目
+                ② 读 ROADMAP 得知 8 阶段 23 迭代
+                ③ bash 统计 mini_agent/ 共 7 个 .py 文件"
+[2] user       "把总结写入 summary.md"                      ← 原 [9]
+[3] assistant  content=null, tool_calls=[c3: write_file]     ← 原 [10]
+[4] tool       c3 → "已写入 summary.md（120 字符，3 行）"     ← 原 [11]
+[5] assistant  "已写入 summary.md，包含迭代规划与文件统计。"   ← 原 [12]
+```
+
+变化对照：
+
+| 压缩前 | 压缩后 | 说明 |
+|--------|--------|------|
+| `[0]` system | `[0]` 原样 | 前缀逐字节稳定（prompt cache 友好） |
+| `[1]..[6]` 6 条 | `[1]` boundary + 摘要 | LLM 摘要压缩为一条 user 消息 |
+| `[7]` tool(c2) | **被删除** | 刀口拆散 c2 配对 → 孤儿被不变量保护清理；结果已进摘要 |
+| `[8]` assistant | **进摘要** | 「7 个文件」的信息由摘要第 ③ 条承载 |
+| `[9]..[12]` 4 条 | `[2]..[5]` 原样 | 最近一轮完整保留（含 c3 配对） |
+| 13 条 / ~8200 tok | 6 条 / ~900 tok | 估算降 ~89% |
+
+这个例子同时演示了三件事：boundary 的结构（`type/pre_tokens/compacted_messages`
+三元信息 + 摘要正文）、配对保护的现实触发（刀口拆散 → 孤儿清理，而非调整刀口
+——`_fold_boundary_adjust` 只用于 snip 层，auto 层依赖事后清理，这就是
+「宁可保守也不发非法请求」）、以及压缩后模型依然能回答「刚才统计了多少文件」
+（摘要第 ③ 条承载了原 tool 结果的信息）。
+
 ### 2.4 熔断与 reactive（防「压缩风暴」）
 
 auto 压缩调用 LLM 摘要本身也消耗 token。若摘要后仍超阈值 → 再压缩 →

@@ -96,7 +96,8 @@
 2. `tests/` 新增单测（假客户端，不烧 API key）
 3. `docs/iterations/NN-xxx.md` 拆解：动机 → 设计 → 代码讲解 → 环境与运行指令 → 与 Claude Code 概念对应关系
 4. 核心机制配 Mermaid 图（流程图/时序图；**节点必须按源码模块分组**：flowchart 用 subgraph、sequenceDiagram 用 box，方便理解功能归属；GitHub 原生渲染）
-5. git commit（Conventional Commits）
+5. 核心机制配**实际数据变化的例子**（像迭代 5 的 messages 演变/请求体 JSON 那样：操作前后具体数据对比，而非抽象结构示意）
+6. git commit（Conventional Commits）
 
 ## 当前状态
 
