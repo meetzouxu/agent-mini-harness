@@ -85,7 +85,53 @@ flowchart TD
 文件路径、git 历史都可实时获取，不配进记忆。feedback 类强调双通道捕获
 （失败与成功都要记），否则 AI 会越来越保守。
 
-### 2.3 实战演示：一条记忆的一生（数据变化）
+### 2.3 文件层机制：save 怎么写入、list_all/load_index 怎么读取
+
+**没有数据库，文件就是数据源**。四类文件是 source of truth，
+MEMORY.md 是每次读取时重建的派生物。
+
+#### save 的三步（以 `save(MemoryEntry("project", "合并冻结从周四开始"))` 为例）
+
+```python
+# ① 查重（读该类已有内容）
+existing = {e.content for e in self.list_all() if e.category == "project"}
+if entry.content in existing:
+    return False                    # 「合并冻结从周四开始」已存在 → 跳过
+
+# ② 追加一行（append-only，永不重写历史行）
+with (self.root / "project.md").open("a", encoding="utf-8") as f:
+    f.write(f"- {entry.content}\n")
+
+# ③ 类内条数 > 8 → consolidate（裁最旧 + 去重）
+```
+
+文件的前后对比（**写入 = 追加一行**）：
+
+```text
+# save 前 .memory/project.md          # save 后 .memory/project.md
+- 上季度 OKR 是稳定性                 - 上季度 OKR 是稳定性
+                                      - 合并冻结从周四开始
+```
+
+类别由**文件名**决定（project.md 里的行都是 project 类），内容取行内
+`"- "` 前缀之后的文本——这就是文件格式的全部协议。
+
+#### 读取：list_all 与 load_index
+
+`list_all()` 把四文件读成结构化条目（side_query / 查重 / /memory 命令都调它）：
+
+```python
+for category in ("user", "feedback", "project", "reference"):   # 文件名 = 类别
+    for line in (root / f"{category}.md").read_text().splitlines():
+        if line.startswith("- "):                               # 条目行
+            entries.append(MemoryEntry(category, line[2:]))     # 去前缀得内容
+```
+
+`load_index()` 是**全量重建**而非增量维护：list_all → 按类分组 → 拼出
+MEMORY.md → 超限截断 → 写盘。四文件永远可以删掉 MEMORY.md 重建它——
+这是「索引是派生物」的检验标准。
+
+### 2.4 实战演示：一条记忆的一生（数据变化）
 
 用户在 REPL 中说「**记住：发布前要跑全量回归测试**」。
 
@@ -140,21 +186,86 @@ MemoryEntry(category="project", content="发布前要跑全量回归测试", cre
 同一条记忆展示过就进 `_surfaced` 集合（已展示去重）——下一轮同话题不再
 重复注入，5 槽预算花在新候选上（对应 CC alreadySurfaced）。
 
-### 2.4 召回器：2-gram 打分 vs Sonnet 侧查询
+### 2.5 召回器详解：side_query 与 2-gram 打分（数据全过程）
 
-CC 用轻量 Sonnet 调用从记忆清单里**语义筛选** ≤5 条；教学版用 2-gram 词集合
-交集打分——零 LLM 调用、可离线测试。代价是**已知局限**：无法跨语言语义匹配
-（query "pipeline" 对不上记忆「流水线」）。开发中实测踩到这个坑（单测
-`test_english_query`），顺手加了英文单复数归一。
+#### 2-gram 是什么
 
-### 2.5 漂移防御（对应 TRUSTING_RECALL_SECTION）
+n-gram 是 NLP 的基础概念：**把文本切成 n 个连续单元的滑动窗口片段**。
+2-gram（bigram）= 相邻两个单元。为什么中文需要它：英文有空格天然分词
+（`pipeline bug` → 两个词），中文没有（「合并冻结」是一整串字符，
+切不出「合并」「冻结」这样的词，除非上分词库）。2-gram 是**零依赖的
+最小可行近似**：滑动窗口逐字符取两字——「合并冻结」→ 合并、并冻、冻结。
+
+`_tokens()` 的两条规则：
+
+```python
+# 英文：正则取词（≥2 字符），单复数归一（"bugs" → "bug"）
+re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text.lower())
+# 中文：滑动窗口取 2 字符（仅含汉字的片段才计入）
+text[i:i+2]  # "合并冻结从周四开始" → 合并/并冻/冻结/结从/从周/周四/四开/开始
+```
+
+#### side_query 打分管道（模块分组图）
+
+```mermaid
+flowchart TD
+    subgraph MEM["memory.py · UserMemory.side_query(query, limit=5)"]
+        Q["query 文本<br/>『这周四有合并冻结吗？』"] --> QT["_tokens(query)<br/>英文词(单复数归一)<br/>+ 中文 2-gram 滑窗"]
+        F[".memory/ 四文件"] --> LT["list_all()<br/>每行一条 MemoryEntry"]
+        LT --> ET["逐条 _tokens(content)"]
+        QT --> IS{"token 集合交集 > 0 ?"}
+        ET --> IS
+        IS -->|"是"| SCORE["score = |交集|<br/>交集越大越相关"]
+        IS -->|"否"| DROP["丢弃(得分 0)"]
+        SCORE --> SORT["按 score 降序"]
+        SORT --> TOP["取前 5 条<br/>排除 exclude_contents<br/>(已展示去重)"]
+    end
+    TOP --> OUT["命中记忆 → 注入 [相关记忆]<br/>(session.py 调用方)"]
+```
+
+#### 一次真实打分的全过程数据
+
+记忆库（四文件内容）与 query = **「这周四有合并冻结吗？」**：
+
+```text
+_tokens(query) = {这周, 周四, 四有, 有合, 合并, 并冻, 冻结, 结吗}
+                 （8 个中文 2-gram）
+```
+
+| 记忆（类别:内容） | _tokens(content) | 与 query 的交集 | score |
+|------------------|------------------|------------------|-------|
+| project: 合并冻结从周四开始 | 合并,并冻,冻结,结从,从周,周四,四开,开始 | **合并,并冻,冻结,周四** | **4** |
+| user: 用户偏好用 pytest 写测试 | 用户,户偏,偏好,pytest,写测,测试 | ∅ | 0 |
+| feedback: 不要 mock 数据库 | 不要,mock,数据,据库 | ∅ | 0 |
+| reference: 流水线 bug 记录在 Linear | 流水,水线,bug,记录,录在,linear,ingest | ∅ | 0 |
+
+→ 只有第一条 score>0，命中并注入。
+
+英文侧同理（query = "where are pipeline bugs tracked"）：
+
+```text
+_tokens(query)   = {where, are, pipeline, bug, tracked}   ← "bugs"归一成"bug"
+_tokens(reference 记忆) = {流水, 水线, bug, 记录, 录在, linear, ingest}
+交集 = {bug} → score = 1 → 命中
+```
+
+#### 已知局限（关键词召回的固有天花板）
+
+- **同义/跨语言无字面交集**：query "pipeline" 对记忆「流水线」交分为 0
+  ——pipeline 与 流水/水线 无任何共同 token。CC 用 Sonnet 语义召回
+  正是为解决这类；教学版接受它，代价是召回偏保守（宁漏勿错）
+- **词形变化仅覆盖单复数**：running/ran 这类变形无能为力
+- **交集大 ≠ 更相关**的边角：「测试」会在大量记忆里命中——2-gram 打分
+  是相关性粗筛，不是排序语义（CC 的 LLM 召回同样只做筛不做精排）
+
+### 2.6 漂移防御（对应 TRUSTING_RECALL_SECTION）
 
 记忆可能过期。memory 段固定携带：「引用记忆前先验证时效：提到文件/函数的
 记忆是写入时的主张，可能已过时」。CC 的 A/B 测试结论（3/3 vs 0/3）：
 **行动导向的标题**（"Before recommending from memory"）好于抽象描述
 （"Trusting what you recall"）——教学版直接采用胜出文案的语义。
 
-### 2.6 整理（consolidate）
+### 2.7 整理（consolidate）
 
 `save` 后类内条数超 8 → 整理：去重（同内容）+ 每类裁到 8 条（保留最新）。
 开发中修掉一个触发条件 bug：最初按「总条数 ≥24」触发——裁剪一次后总数
