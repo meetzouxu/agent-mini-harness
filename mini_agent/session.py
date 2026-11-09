@@ -20,12 +20,14 @@ docs/conversation/multi-turn.mdx 的 onQueryImpl / submitMessage 链路）：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from .agent import Agent, RunResult
 from .compaction import CompactionConfig, CompactionReport, auto_compact, run_pipeline
 from .memory import UserMemory, extract_memories
 from .prompt import SectionRegistry, build_system_prompt
+from .transcript import RestoredSession, TranscriptWriter, load_transcript
 
 
 @dataclass
@@ -42,6 +44,8 @@ class SessionStats:
     tokens_saved: int = 0         # 压缩节省的估算 token
     # 迭代 7：记忆观测
     memories_saved: int = 0       # 本会话新保存的记忆条数
+    # 迭代 8：持久化观测
+    resumed: bool = False         # 本会话是从 transcript 恢复的
 
 
 class QueryEngine:
@@ -54,6 +58,7 @@ class QueryEngine:
         compaction_config: CompactionConfig | None = None,
         summarizer: Callable[[str], str] | None = None,
         memory: UserMemory | None = None,
+        transcript: TranscriptWriter | None = None,
     ) -> None:
         self.agent = agent
         self.registry = registry
@@ -61,11 +66,19 @@ class QueryEngine:
         self._summarizer = summarizer  # None → 用 agent 的 client 现查
         self.memory = memory  # 迭代 7：跨会话记忆（None → 功能关闭）
         self._surfaced: set[str] = set()  # 已展示去重（对应 CC alreadySurfaced）
+        # 迭代 8：transcript 持久化（None → 功能关闭，兼容旧测试）
+        self.transcript = transcript
+        self.session_meta = None  # transcript 开启时由 _init_transcript 填充
         self.messages: list[dict] = []
         self.stats = SessionStats()
         self.history: list[RunResult] = []  # 每轮的 RunResult（观测用）
         self.last_compaction: CompactionReport | None = None
         self._auto_attempts = 0  # auto 熔断计数
+        # 迭代 8：开新会话 → 写 session_meta 首行（restore_from 会覆写为本会话续写）
+        if self.transcript is not None:
+            self.session_meta = self.transcript.new_session(
+                model=agent.model, cwd=str(Path.cwd())
+            )
 
     # ------------------------------------------------------------------
 
@@ -118,6 +131,39 @@ class QueryEngine:
         self.last_compaction = report
         return report
 
+    def _flush_turn_to_transcript(self, start_len: int) -> None:
+        """把本轮新增的消息追加写入 transcript（append-only 事件流水）。"""
+        if self.transcript is None or self.session_meta is None:
+            return
+        sid = self.session_meta.session_id
+        for msg in self.messages[start_len:]:
+            self.transcript.append_message(sid, msg)
+        self.transcript.append_turn_stats(
+            sid, self.stats.turns,
+            self.stats.input_tokens, self.stats.output_tokens,
+        )
+
+    def restore_from(self, path) -> RestoredSession:
+        """从 transcript 文件恢复会话（对应 CC --resume 链路）。
+
+        恢复全部对话消息 + 累计 stats；恢复后续写同一 session_id 的
+        transcript 文件（CC 语义：resume 后追加而非另开新档）。
+        """
+        if self.transcript is None:
+            raise RuntimeError("restore_from 需要 transcript 已启用")
+        restored = load_transcript(path)
+        self.messages = restored.messages
+        self.session_meta = restored.meta  # 续写同一文件
+        self.stats = SessionStats(
+            turns=restored.turns,
+            input_tokens=restored.input_tokens,
+            output_tokens=restored.output_tokens,
+            resumed=True,
+        )
+        # 熔断计数不跨进程；恢复后若水位仍高，下轮 run_pipeline 自然再触发
+        self._auto_attempts = 0
+        return restored
+
     def submit_message(self, text: str) -> RunResult:
         """提交一条用户消息，跑一轮完整 Agent Loop，返回该轮结果。
 
@@ -146,6 +192,10 @@ class QueryEngine:
             # 静态前缀不变的部分在真实 API 上仍可命中 prompt cache
             self.messages[0] = {"role": "system", "content": system}
 
+        # 迭代 8：记录本轮起点（transcript 增量落盘用；须在管线/system
+        # 之后，避免把上一轮已写过的事件重复写入）
+        turn_start_len = len(self.messages)
+
         # ---- 迭代 7：side-query 按需注入（≤5 条，已展示去重） ----
         # 命中时注入到本轮 user 消息之前——历史前缀不变，不破坏 cache
         if self.memory is not None:
@@ -159,12 +209,6 @@ class QueryEngine:
 
         result = self.agent.run_turn(self.messages, text)
 
-        # ---- 迭代 7：轮后提取（显式「记住」/ 偏好句式 → 跨会话保存） ----
-        if self.memory is not None:
-            for entry in extract_memories(text, result.final_text):
-                if self.memory.save(entry):
-                    self.stats.memories_saved += 1  # 下轮 memory 段缓存失效自动反映
-
         # 跨轮累计（对应 CC 会话级 cost 累计）
         self.stats.turns += 1
         self.stats.input_tokens += result.input_tokens
@@ -172,6 +216,16 @@ class QueryEngine:
         self.stats.tool_calls += result.tool_calls_count
         self.stats.tool_errors += sum(1 for e in result.tool_events if e.is_error)
         self.history.append(result)
+
+        # ---- 迭代 7：轮后提取（显式「记住」/ 偏好句式 → 跨会话保存） ----
+        if self.memory is not None:
+            for entry in extract_memories(text, result.final_text):
+                if self.memory.save(entry):
+                    self.stats.memories_saved += 1  # 下轮 memory 段缓存失效自动反映
+
+        # ---- 迭代 8：本轮增量落盘（崩溃后最多丢当前轮） ----
+        self._flush_turn_to_transcript(turn_start_len)
+
         return result
 
     # ------------------------------------------------------------------

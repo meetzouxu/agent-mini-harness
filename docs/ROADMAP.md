@@ -48,7 +48,7 @@
 
 | # | 主题 | 核心内容 | 对应 Claude Code 概念 |
 |---|------|---------|----------------------|
-| 8 | **保存状态：会话持久化** | JSONL transcript 落盘（一行一条消息）；`--resume` 会话恢复；usage/费用累计 | `sessionStorage.ts`、JSONL transcript |
+| 8 | **保存状态：会话持久化** ✅ | JSONL transcript（sessions/<id>.jsonl，一行一条事件：session_meta/message/turn_stats）；append-only 增量落盘（崩溃最多丢当前轮）；--resume 三形态（latest/id/路径）续写同一文件；半行崩溃跳过计数 + 孤儿 tool_call 清理（配对保护复用）；50MB 读取上限 | `sessionStorage.ts`、JSONL transcript |
 | 9 | **TodoWrite 任务规划** | `todo_write` 工具（pending/in_progress/completed 状态列表）；连续 3 轮未规划注入 reminder；规划能力而非执行能力 | `todo_write` 工具、V1 内存清单与 V2 Task System 切换 |
 | 10 | **Task System 任务图** | `.tasks/{id}.json` 持久化；`blockedBy` 依赖 DAG + `can_start` 检查；claim/complete 认领解锁；文件锁防并发认领（TOCTOU 防护）；与 TodoWrite V1/V2 并存切换 | `utils/tasks.ts`、proper-lockfile |
 
@@ -108,4 +108,5 @@
 - 迭代 5 ✅ 维护上下文：QueryEngine 多轮会话 + SectionRegistry 分段组装 + 确定性缓存 + REPL，18 新单测（全套 102 个通过）。详见 [iterations/05-context.md](iterations/05-context.md)
 - 迭代 6 ✅ 上下文压缩：四层管线（budget/snip/micro/auto）+ 配对不变量保护 + 熔断与 reactive 兜底 + /compact 命令，22 新单测（全套 124 个通过）。详见 [iterations/06-compaction.md](iterations/06-compaction.md)
 - 迭代 7 ✅ 记忆系统：纯文件跨会话记忆（四类 + 索引 + 2-gram 召回 + 轮后提取 + consolidate），23 新单测（全套 147 个通过）。详见 [iterations/07-memory.md](iterations/07-memory.md)
-- 下一步：迭代 8 保存状态（JSONL transcript + --resume 会话恢复）
+- 迭代 8 ✅ 保存状态：JSONL transcript + --resume 恢复 + 崩溃容错，11 新单测（全套 158 个通过）。详见 [iterations/08-transcript.md](iterations/08-transcript.md)
+- 下一步：迭代 9 TodoWrite 任务规划（todo_write 工具 + reminder 注入）

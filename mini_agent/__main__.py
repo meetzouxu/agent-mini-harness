@@ -32,6 +32,7 @@ from .prompt import default_registry
 from .session import QueryEngine
 from .memory import UserMemory
 from .tools import default_tools
+from .transcript import TranscriptWriter, list_sessions, resolve_resume_target
 
 DEFAULT_SYSTEM_PROMPT = """\
 你是 mini-agent，一个运行在终端里的编码助手，通过工具读写文件、搜索代码、执行命令来完成任务。
@@ -137,6 +138,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-turns", type=int, default=None, help="最大循环轮次（默认读 .env 或 15）")
     parser.add_argument("--quiet", action="store_true", help="安静模式：只输出最终答案（ask 一律拒绝）")
     parser.add_argument(
+        "--resume",
+        default=None,
+        help="恢复会话：latest（最近）/ 会话 ID / .jsonl 文件路径",
+    )
+    parser.add_argument(
+        "--list-sessions",
+        action="store_true",
+        help="列出全部已持久化会话",
+    )
+    parser.add_argument(
         "--permission-mode",
         default="default",
         choices=_VALID_MODES,
@@ -148,6 +159,15 @@ def main(argv: list[str] | None = None) -> int:
         help="非交互自动放行写操作（危险；等价于 acceptEdits+所有工具放行的 bypass 语义弱化版）",
     )
     args = parser.parse_args(argv)
+
+    if args.list_sessions:
+        sessions = list_sessions()
+        if not sessions:
+            print("（尚无已持久化会话——REPL 会话自动落盘 sessions/*.jsonl）")
+            return 0
+        for s in sessions:
+            print(f"{s.session_id}  {s.created_at}  {s.model}  ({s.cwd})")
+        return 0
 
     cfg = load_config()
     client = build_client(cfg)
@@ -184,7 +204,20 @@ def main(argv: list[str] | None = None) -> int:
         hooks=hooks,
     )
     registry = default_registry(tools, user_memory=memory)  # 捕获 tools/memory 引用：变化 → 下轮自动反映
-    engine = QueryEngine(agent, registry, memory=memory)
+    # 迭代 8：会话持久化（REPL 与单次任务都落盘）
+    transcript = TranscriptWriter()
+    engine = QueryEngine(agent, registry, memory=memory, transcript=transcript)
+
+    if args.resume:
+        path = resolve_resume_target(args.resume)
+        restored = engine.restore_from(path)
+        print(
+            f"↻ 已恢复会话 {restored.meta.session_id}"
+            f"（{restored.meta.created_at}，{restored.turns} 轮，"
+            f"{len(restored.messages)} 条消息"
+            + (f"，跳过 {restored.skipped_lines} 行损坏记录" if restored.skipped_lines else "")
+            + "）"
+        )
 
     if args.prompt is None:
         return _run_repl(engine)
