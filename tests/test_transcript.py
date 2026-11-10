@@ -270,16 +270,17 @@ class EngineIntegrationTests(unittest.TestCase):
         self.assertFalse(engine2.last_compaction.auto_triggered)
 
     def test_clear_starts_new_session_file(self):
-        """/clear 开新档：新对话写入新文件，不再追加旧档。"""
+        """/clear 后新对话写入新文件，不再追加旧档（惰性开档）。"""
         client = FakeClient([make_response(content="第一轮")])
         engine = self._engine(client)
         engine.submit_message("hi")
         sid1 = engine.session_meta.session_id
         engine.clear()
-        sid2 = engine.session_meta.session_id
-        self.assertNotEqual(sid1, sid2)
+        self.assertIsNone(engine.session_meta)  # 惰性：清空即重置，不立即开档
         client.responses = [make_response(content="清空后")]
         engine.submit_message("新开始")
+        sid2 = engine.session_meta.session_id
+        self.assertNotEqual(sid1, sid2)  # 首次 submit 才开新档
         self.assertIn("新开始", (Path("sessions") / f"{sid2}.jsonl").read_text())
         self.assertNotIn("新开始", (Path("sessions") / f"{sid1}.jsonl").read_text())
 
@@ -300,6 +301,36 @@ class EngineIntegrationTests(unittest.TestCase):
         self.assertTrue(
             str(engine2.messages[1].get("content", "")).startswith("[compact_boundary")
         )
+
+    def test_resume_does_not_create_orphan_session(self):
+        """--resume 不应新开档（回归测试：构造时预开档的孤儿文件 bug）。
+
+        曾的执行顺序：QueryEngine(...) 构造 → new_session 写新文件 →
+        restore_from 覆写 session_meta —— 构造产生的空档永远留在 sessions/ 里，
+        且 --resume latest 可能恢复到这个空档。修复后构造不再开档。
+        """
+        # 第一个 engine 跑一轮产生真实会话
+        client = FakeClient([make_response(content="第一轮")])
+        engine = self._engine(client)
+        engine.submit_message("hi")
+        sid = engine.session_meta.session_id
+        before = set(p.name for p in Path("sessions").glob("*.jsonl"))
+
+        # 模拟 CLI：新 engine（构造不开档）→ resume 目标档
+        client2 = FakeClient([])
+        engine2 = self._engine(client2)
+        restored = engine2.restore_from(Path("sessions") / f"{sid}.jsonl")
+        self.assertEqual(restored.meta.session_id, sid)
+        # 此时 sessions/ 不应多出新文件（构造未预开档）
+        after = set(p.name for p in Path("sessions").glob("*.jsonl"))
+        self.assertEqual(after, before)
+        # 未 submit 前 flush 不产生写入；恢复档已含完整响应脚本
+        client2.responses = [make_response(content="续写进目标档")]
+        engine2.submit_message("继续")  # ← 首次 submit 走 _ensure_session_open，
+        # 但 session_meta 已是恢复档 → 不会开新档，续写目标档
+        self.assertEqual(engine2.session_meta.session_id, sid)
+        after2 = set(p.name for p in Path("sessions").glob("*.jsonl"))
+        self.assertEqual(after2, before)  # 依然没有新文件
 
     def test_resume_target_resolution(self):
         """resolve_resume_target 三形态：latest / id / 文件路径。"""

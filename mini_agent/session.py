@@ -80,11 +80,18 @@ class QueryEngine:
         self.history: list[RunResult] = []  # 每轮的 RunResult（观测用）
         self.last_compaction: CompactionReport | None = None
         self._auto_attempts = 0  # auto 熔断计数
-        # 迭代 8：开新会话 → 写 session_meta 首行（restore_from 会覆写为本会话续写）
-        if self.transcript is not None:
-            self.session_meta = self.transcript.new_session(
-                model=agent.model, cwd=str(Path.cwd())
-            )
+        # 迭代 8 修正：**惰性开档**——不在构造时 new_session：
+        # CLI 装配顺序是先构造 engine、后 restore_from；构造即开档会先留下
+        # 一个只有 meta 的孤儿文件，且 --resume latest 可能恢复到这个空档。
+        # 改为首次 submit 时才开新档（restore_from 则直接覆写为恢复的目标档）
+
+    def _ensure_session_open(self) -> None:
+        """首次 submit 时开新档（写 session_meta 首行）。已开档/已恢复 → 幂等跳过。"""
+        if self.transcript is None or self.session_meta is not None:
+            return
+        self.session_meta = self.transcript.new_session(
+            model=self.agent.model, cwd=str(Path.cwd())
+        )
 
     # ------------------------------------------------------------------
 
@@ -169,8 +176,8 @@ class QueryEngine:
     def restore_from(self, path) -> RestoredSession:
         """从 transcript 文件恢复会话（对应 CC --resume 链路）。
 
-        恢复全部对话消息 + 累计 stats；恢复后续写同一 session_id 的
-        transcript 文件（CC 语义：resume 后追加而非另开新档）。
+        恢复全部对话消息 + 累计 stats；恢复后**直接续写目标档**（构造时
+        不再预开新档——否则每次 --resume 都会多出一个孤儿空档）。
         """
         if self.transcript is None:
             raise RuntimeError("restore_from 需要 transcript 已启用")
@@ -224,6 +231,7 @@ class QueryEngine:
         self.last_compaction = report
 
         # 每轮组装 system prompt（静态段命中缓存；动态段确定性比较）
+        self._ensure_session_open()
         system = build_system_prompt(self.registry.resolve())
         if not self.messages:
             if system:
@@ -288,10 +296,8 @@ class QueryEngine:
         self.last_compaction = None
         self._auto_attempts = 0
         self._surfaced = set()
-        if self.transcript is not None:
-            self.session_meta = self.transcript.new_session(
-                model=self.agent.model, cwd=str(Path.cwd())
-            )
+        # 惰性开档：清空 session_meta → 下次 submit 自动开新档（_ensure_session_open）
+        self.session_meta = None
 
     def message_count(self) -> int:
         return len(self.messages)
