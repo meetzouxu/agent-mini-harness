@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Callable
 
 from .agent import Agent, RunResult
-from .compaction import CompactionConfig, CompactionReport, auto_compact, run_pipeline
+from .compaction import (
+    COMPACT_BOUNDARY_PREFIX,
+    CompactionConfig,
+    CompactionReport,
+    auto_compact,
+    run_pipeline,
+)
 from .memory import UserMemory, extract_memories
 from .prompt import SectionRegistry, build_system_prompt
 from .transcript import RestoredSession, TranscriptWriter, load_transcript
@@ -123,6 +129,8 @@ class QueryEngine:
             self.messages, wrapped, self.compaction_config, boundary_type="manual"
         )
         self._auto_attempts += 1
+        # 迭代 8：手动压缩的 boundary 也是事件，同样落盘（恢复时切片消费）
+        self._persist_compaction_boundary()
         report = CompactionReport(
             pre_tokens=pre,
             post_tokens=len(self.messages),
@@ -130,6 +138,21 @@ class QueryEngine:
         )
         self.last_compaction = report
         return report
+
+    def _persist_compaction_boundary(self) -> None:
+        """把本轮压缩产生的 boundary 消息落盘（迭代 8 修正）。
+
+        run_pipeline 替换内存 messages 后，boundary 位于列表前部（turn_start_len
+        之前），常规 flush 写不到它——必须显式落盘。否则恢复时拿不到压缩结果，
+        每个新进程都要重新 LLM 摘要一次。snip/micro 的占位同理不落盘，但它们
+        无 LLM 成本、恢复后确定性重放即可，无需持久化。
+        """
+        if self.transcript is None or self.session_meta is None:
+            return
+        for m in self.messages:
+            if str(m.get("content", "")).startswith(COMPACT_BOUNDARY_PREFIX):
+                self.transcript.append_message(self.session_meta.session_id, m)
+                return
 
     def _flush_turn_to_transcript(self, start_len: int) -> None:
         """把本轮新增的消息追加写入 transcript（append-only 事件流水）。"""
@@ -152,7 +175,23 @@ class QueryEngine:
         if self.transcript is None:
             raise RuntimeError("restore_from 需要 transcript 已启用")
         restored = load_transcript(path)
-        self.messages = restored.messages
+        # boundary 感知恢复（对应 CC getMessagesAfterBoundary）：transcript 是
+        # 事实流水——压缩前的旧消息永远留在文件里；若会话压缩过，文件里会有
+        # boundary 事件。恢复时从最后一个 boundary（含）开始切：拿到的就是
+        # 压缩后的工作集（摘要+尾部），无需重新 LLM 摘要。
+        msgs = restored.messages
+        last_boundary = -1
+        for i, m in enumerate(msgs):
+            if str(m.get("content", "")).startswith(COMPACT_BOUNDARY_PREFIX):
+                last_boundary = i
+        if last_boundary >= 0:
+            msgs = msgs[last_boundary:]
+            # 切片后没有 system；下一轮 submit 会 insert(0) 补上当前 system
+            restored = RestoredSession(
+                restored.meta, msgs, restored.turns,
+                restored.input_tokens, restored.output_tokens, restored.skipped_lines,
+            )
+        self.messages = msgs
         self.session_meta = restored.meta  # 续写同一文件
         self.stats = SessionStats(
             turns=restored.turns,
@@ -176,8 +215,10 @@ class QueryEngine:
             self.messages, self.compaction_config, self._resolve_summarizer(),
             auto_attempts=self._auto_attempts,
         )
-        if report.auto_triggered:
+        if report.auto_triggered or report.reactive_triggered:
             self._auto_attempts += 1  # 熔断计数
+            # 迭代 8：boundary 是事件，落盘（恢复时切片消费，避免重复摘要）
+            self._persist_compaction_boundary()
         self.stats.compactions += 1 if report.auto_triggered else 0
         self.stats.tokens_saved += report.tokens_saved
         self.last_compaction = report
@@ -187,10 +228,15 @@ class QueryEngine:
         if not self.messages:
             if system:
                 self.messages.append({"role": "system", "content": system})
-        elif self.messages[0].get("content") != system:
-            # 动态区变化（工具增删 / cwd 切换 / 新记忆）→ 替换 system，
-            # 静态前缀不变的部分在真实 API 上仍可命中 prompt cache
-            self.messages[0] = {"role": "system", "content": system}
+        elif self.messages[0].get("role") == "system":
+            if self.messages[0].get("content") != system:
+                # 动态区变化（工具增删 / cwd 切换 / 新记忆）→ 替换 system，
+                # 静态前缀不变的部分在真实 API 上仍可命中 prompt cache
+                self.messages[0] = {"role": "system", "content": system}
+        elif system:
+            # 恢复/压缩后的列表可能以 boundary(user) 开头：插入而非替换，
+            # 否则 boundary 会被当 system 覆掉（潜在毁灭性 bug）
+            self.messages.insert(0, {"role": "system", "content": system})
 
         # 迭代 8：记录本轮起点（transcript 增量落盘用；须在管线/system
         # 之后，避免把上一轮已写过的事件重复写入）
@@ -232,7 +278,9 @@ class QueryEngine:
 
     def clear(self) -> None:
         """清空会话（对应 CC /clear）：丢弃全部历史、section 缓存与熔断计数。
-        跨会话记忆不受影响（记忆的生命周期 = 磁盘文件，非会话）。"""
+        跨会话记忆不受影响（记忆的生命周期 = 磁盘文件，非会话）。
+        迭代 8：transcript 开新档（新 session 文件）——旧文件保留供回溯，
+        新对话不再写入旧文件（否则恢复旧档会重放已清空的历史）。"""
         self.messages = []
         self.registry.reset()
         self.stats = SessionStats()
@@ -240,6 +288,10 @@ class QueryEngine:
         self.last_compaction = None
         self._auto_attempts = 0
         self._surfaced = set()
+        if self.transcript is not None:
+            self.session_meta = self.transcript.new_session(
+                model=self.agent.model, cwd=str(Path.cwd())
+            )
 
     def message_count(self) -> int:
         return len(self.messages)

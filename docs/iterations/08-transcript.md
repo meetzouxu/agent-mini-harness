@@ -135,23 +135,105 @@ engine2.restore_from(path) 之后:
 
 ### 2.5 崩溃容错（append-only 的红利）
 
-两层防线（都有单测锁定）：
+先把「崩溃」这个调具体化——进程在什么时刻被杀，会丢什么、不丢什么。
 
-1. **半行 JSON**（进程被杀在写入中途）：`json.loads` 失败 → 跳过该行并计入
-   `skipped_lines`（恢复时向用户报告「跳过 N 行损坏记录」）——前面的行完整无损
-2. **孤儿 tool_call**（崩溃在 assistant(tool_calls) 与 tool 消息之间）：
-   恢复时经 `preserve_api_invariants` 清理（迭代 6 的配对保护第四次兑现——
-   压缩、恢复共用同一不变量，**宁可保守也不发非法请求**）
+#### 崩损面分析：一条消息的一生 vs 落盘时机
 
-CC 的 50MB 读取上限（防超大会话 OOM）同样复刻。
+一轮 submit 的内部顺序（谁在什么时候落盘）：
 
-### 2.6 与压缩的协作（boundary 不重复压缩）
+```text
+submit_message("读文件")
+ ① run_pipeline 压缩          （纯内存，不落盘）
+  ② boundary 落盘             （←仅当本轮触发 auto/reactive）
+  ③ system 组装/替换           （内存）
+  ④ turn_start_len = len(messages)   （内存记账）
+  ⑤ run_turn 循环：
+     调模型 → assistant append（内存）
+     工具执行 → tool append（内存，含 budget 落盘）
+     …循环…
+  ⑥ 本轮全部新消息 + turn_stats 一次性落盘（同步写盘）
+```
 
-transcript 照实记录一切事件（fact stream）——包括压缩后的消息形态。
-恢复以**文件末尾的消息序列**为准：若上次会话已 auto 压缩，恢复的 messages
-第一条就是 `[compact_boundary …]` 摘要——**不需要也不应该再次压缩**
-（对应 CC getMessagesAfterBoundary 的恢复语义）。熔断计数跨进程归零是
-安全的：新进程若水位仍高，下轮 run_pipeline 自然再触发。
+关键点：**⑥ 是同步的**——一轮结束后、返回用户前，write() 已经完成。
+所以崩溃窗口 = 正在执行 ⑤ 的时刻。对每个时刻做崩溃推演（数据变化）：
+
+| 崩溃时刻 | 内存 messages | 磁盘 transcript | 恢复结果 | 丢失量 |
+|---------|---------------|-----------------|---------|--------|
+| ①② 后（压缩完，本轮未开始） | 已压缩（含 boundary） | boundary 已落盘 | 压缩结果完整保留，**不重新摘要** | 0 |
+| ⑤ 中：assistant(tool_calls) 刚写内存，tool 未落盘 | 含孤儿 tool_call | 无此轮记录 | 半行都没有——**整轮丢弃** | ≤1 轮 |
+| ⑤ 中：3 条已入内存但未 flush | 3 条在内存 | 上轮为止完整 | 整轮丢弃 | ≤1 轮 |
+| ⑥ 写盘中途（写完第 2 行，第 3 行只写一半） | 3 条 | 2 行完整 + 半行 | 半行解析失败 → skipped_lines 计数，**前两行保住** | 半条消息 |
+| ⑥ 完成后 | =磁盘 | 完整 | 完整恢复 | 0 |
+
+两个结论：
+
+1. **崩溃最多丢当前轮**（粒度是「轮」不是「会话」）——这是把 flush 放在轮末而非会话末的意义：轮内的多步工具调用只需最后一次写盘
+2. **半行损坏的传播边界**：单次 write 不是原子的——磁盘上可能出现写了一半的行。防线是逐行独立解析：`json.loads` 失败的行跳过并计入 `skipped_lines`，把风险收敛为「丢半行」而非「丢全文件」（恢复时向用户报告「跳过 N 行损坏记录」）
+
+#### 孤儿 tool_call：写入中断的第二形态
+
+崩溃还有另一种切入：不是半行，而是**完整行但不完整对**——进程死在
+assistant(tool_calls) 落盘之后、对应 tool 消息落盘之前（两者都在 ⑥ 一次性写，
+但崩溃可以发生在两行 write 之间）。恢复时：
+
+```text
+transcript 尾部：  …assistant tool_calls=[c1, c2]  ← 已写入
+                                     c1 的 tool 消息    ← 已写入
+                                     c2 的 tool 消息    ← 未写入（崩溃）
+恢复侧：load_transcript → preserve_api_invariants 清理 c2
+         （宁删孤儿不发非法请求——迭代 6 配对保护的第四次复用）
+```
+
+### 2.6 落盘时机全景：什么写、什么不写、为什么
+
+这是最容易误解的部分——逐项列清单（含本轮修正的两个 bug）：
+
+| 事件 | 落盘？ | 时机与理由 |
+|------|-------|-----------|
+| session_meta | ✅ 首行 | new_session 时（初始化或 /clear 开新档） |
+| 本轮新消息（user/assistant/tool） | ✅ | ⑥ 轮末同步 flush（turn_start_len 切片） |
+| turn_stats | ✅ | ⑥ 同上，一条记录 |
+| **压缩 boundary** | ✅ **（本轮修正）** | ② 触发时立即写。曾遗漏：turn_start_len 在压缩之后记录，boundary 位于其前，轮末 flush 永远写不到它 → 恢复时拿不到摘要，每个新进程重新烧一次 LLM。修复后 boundary 是事件，恢复可切片消费 |
+| **压缩前的旧消息** | ❌ 不删不补 | transcript 是事实流水（fact stream）：压缩只改内存，旧消息永远留在文件里。想「看到压缩后状态」靠恢复切片（见 2.7） |
+| snip/micro 占位 | ❌ | 无 LLM 成本；恢复后重放同样的确定性变换即可（重跑 run_pipeline 结果相同） |
+| system 替换 | ⭕ 隐式 | 不单独记事件——但每次都作为 message 落盘新值吗？否：system 位于 turn_start_len 之前，常规 flush 不写。**恢复时重新组装**（registry.resolve 确定性重建，与迭代 5 缓存同源） |
+| 工具大结果全文 | ✅ 另档 | budget 层落 `.compact-cache/<tool>-<sha1>.txt`（内容寻址；transcript 里只有占位） |
+| 记忆保存 | ✅ 另档 | `.memory/` 四文件（迭代 7；transcript 只记对话） |
+
+**增量语义的核心**：`turn_start_len` 必须在压缩与 system 之后记录——
+否则会把上一轮已写过的事件重复写入（transcript 变成无限膨胀的流水）。
+
+另一个本轮修正的 bug：`/clear` 现在**开新档**（新 session 文件）——
+否则清空后继续写旧文件，将来 --resume 旧档会重放已清空的历史。
+
+### 2.7 恢复与压缩的交互（boundary 切片）
+
+对应 CC getMessagesAfterBoundary。文件里压缩前的旧消息**永远存在**——
+恢复时如何得到「压缩后状态」？从最后一个 boundary（含）开始切：
+
+```text
+transcript 文件（事实流水）：
+  [meta, m1, m2, …, m18,                      ← 压缩前的历史（永远留在文件里）
+   boundary(auto), m19, m20]                  ← 压缩事件 + 之后的新消息
+
+restore_from 切片：
+  找最后一个 boundary → msgs = msgs[last_boundary:]
+
+恢复后的 engine.messages：
+  [boundary(auto, 摘要+尾部), m19, m20]        ← 就是压缩后的工作集
+  （system 缺失 → 下一轮 submit 时 insert(0) 重建——
+    这也修复了第三个 bug：曾用 messages[0]="system" 直接覆写，
+    boundary 会被当 system 毁掉）
+```
+
+三个效果的实测验证（单测 test_boundary_persisted_and_restore_slices）：
+
+1. 恢复后的 messages **以 boundary 开头**——不是全历史重放
+2. 下一轮水位已低 → **不重新触发 auto**（summarizer 被调用即断言失败）
+3. LLM 摘要费用只花一次——换进程不重复花钱
+
+熔断计数跨进程归零是安全的：若恢复后水位仍高（尾部保留太多），下轮
+run_pipeline 自然再触发——新的压缩事件又落盘，旧的 boundary 失效。
 
 ## 3. 运行指令
 
@@ -182,12 +264,17 @@ head -1 sessions/<id>.jsonl                       # 人读文件：首行即元�
 |----|--------|
 | WriterTests ×3 | meta 首行、JSONL 行格式（中文不转义）、目录删除后 mkdir 重试 |
 | RestoreTests ×5 | 两轮完整往返（messages+stats）、**半行崩溃跳过计数**、**孤儿 tool_call 清理**、缺 meta 拒绝、list 倒序 |
-| EngineIntegrationTests ×3 | **跨进程接力**（新 engine 恢复后续写同一文件、turn=3 落盘）、transcript=None 向后兼容、resume 三形态解析 |
+| EngineIntegrationTests ×6 | **跨进程接力**（新 engine 恢复后续写同一文件、turn=3 落盘）、**boundary 落盘 + 恢复切片 + 不重新摘要**（summarizer 被调即断言失败）、**恢复后 boundary 开头时 system insert 不覆写**、**/clear 开新档**（新对话不入旧档）、transcript=None 向后兼容、resume 三形态解析 |
 
 开发中修掉两个集成 bug（都有普适教学价值，写进 2.5）：
 `return result` 误置于 stats 累计之前（死代码）；`SimpleNamespace` 对象
 无法 JSON 序列化——`_plain_message` 落盘前规约（与迭代 6 的 `_tc_field`
 同源：假客户端的浅拷贝残留是反复出现的坑）。
+
+用户提问触发深挖又修三个真 bug（写进 2.6/2.7，均有单测锁定）：
+boundary 不落盘（恢复即重复烧 LLM 摘要）、system 覆写 boundary
+（恢复后丢失摘要）、/clear 不开新档（resume 重放已清空历史）。
+这是「文档讲不清楚 = 实现有缝隙」的又一次印证。
 
 ## 5. 本迭代刻意不做的事
 

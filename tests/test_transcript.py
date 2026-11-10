@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mini_agent.agent import Agent  # noqa: E402
 from mini_agent.compaction import preserve_api_invariants  # noqa: E402
+from mini_agent.compaction import CompactionConfig  # noqa: E402
 from mini_agent.prompt import default_registry  # noqa: E402
 from mini_agent.session import QueryEngine  # noqa: E402
 from mini_agent.tools import default_tools  # noqa: E402
@@ -184,7 +185,12 @@ class EngineIntegrationTests(unittest.TestCase):
         return QueryEngine(
             agent, registry,
             transcript=TranscriptWriter(Path("sessions")),
-            summarizer=lambda t: "摘要",
+            compaction_config=CompactionConfig(
+                context_window_tokens=1000,   # 小窗口：长回答可触发 auto
+                snip_message_threshold=100,   # 关闭 snip（不干扰本测试焦点）
+                auto_keep_tail=2,
+            ),
+            summarizer=lambda t: "摘要：多轮任务已完成",
         )
 
     def test_auto_persist_and_resume_same_file(self):
@@ -232,6 +238,68 @@ class EngineIntegrationTests(unittest.TestCase):
         self.assertFalse(Path("sessions").exists())
         with self.assertRaises(RuntimeError):
             engine.restore_from(Path("nonexistent.jsonl"))
+
+    def test_boundary_persisted_and_restore_slices(self):
+        """auto 压缩后 boundary 落盘；恢复时从 boundary 切片——不重新摘要。"""
+        client = FakeClient(
+            [make_response(content=f"第 {i} 轮回答" * 60) for i in range(4)]
+        )
+        engine = self._engine(client)  # 小窗口配置，长回答触发 auto
+        for i in range(4):
+            engine.submit_message(f"问题 {i}" * 100)
+        sid = engine.session_meta.session_id
+        path = Path("sessions") / f"{sid}.jsonl"
+        raw = path.read_text(encoding="utf-8")
+        # boundary 已作为事件落盘
+        self.assertIn("[compact_boundary", raw)
+
+        # 新进程恢复：拿到的应是压缩后工作集（boundary 开头），而非全历史
+        client2 = FakeClient([])
+        engine2 = self._engine(client2)
+        restored = engine2.restore_from(path)
+        first = str(restored.messages[0].get("content", ""))
+        self.assertTrue(first.startswith("[compact_boundary"), msg=first[:80])
+
+        # 恢复后水位低：下一轮不应再触发 auto（summarizer 若被调用即报错）
+        def must_not_summarize(text: str) -> str:
+            raise AssertionError("恢复后不应重新摘要")
+
+        engine2._summarizer = must_not_summarize
+        client2.responses = [make_response(content="继续")]
+        engine2.submit_message("继续")
+        self.assertFalse(engine2.last_compaction.auto_triggered)
+
+    def test_clear_starts_new_session_file(self):
+        """/clear 开新档：新对话写入新文件，不再追加旧档。"""
+        client = FakeClient([make_response(content="第一轮")])
+        engine = self._engine(client)
+        engine.submit_message("hi")
+        sid1 = engine.session_meta.session_id
+        engine.clear()
+        sid2 = engine.session_meta.session_id
+        self.assertNotEqual(sid1, sid2)
+        client.responses = [make_response(content="清空后")]
+        engine.submit_message("新开始")
+        self.assertIn("新开始", (Path("sessions") / f"{sid2}.jsonl").read_text())
+        self.assertNotIn("新开始", (Path("sessions") / f"{sid1}.jsonl").read_text())
+
+    def test_restore_boundary_first_system_inserted(self):
+        """恢复后列表以 boundary(user) 开头 → 下轮 submit 应 insert system 而非覆掉 boundary。"""
+        client = FakeClient([make_response(content=f"第 {i} 轮回答" * 60) for i in range(4)])
+        engine = self._engine(client)
+        for i in range(4):
+            engine.submit_message(f"问题 {i}" * 100)
+        path = Path("sessions") / f"{engine.session_meta.session_id}.jsonl"
+
+        client2 = FakeClient([make_response(content="ok")])
+        engine2 = self._engine(client2)
+        engine2.restore_from(path)
+        engine2.submit_message("继续")
+        # system 在头部，boundary 紧随其后且未被覆掉
+        self.assertEqual(engine2.messages[0].get("role"), "system")
+        self.assertTrue(
+            str(engine2.messages[1].get("content", "")).startswith("[compact_boundary")
+        )
 
     def test_resume_target_resolution(self):
         """resolve_resume_target 三形态：latest / id / 文件路径。"""
